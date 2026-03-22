@@ -46,6 +46,21 @@
 #define US_ALERT_FULL_CM  5.0f
 #define US_BEEP_SLOW_MS   400U
 #define US_BEEP_FAST_MS    80U
+
+/* Motor-1 mapping
+ * ENA -> PA8, IN1 -> PB14, IN2 -> PB15, C1 -> PA6(TIM3_CH1), C2 -> PA7(TIM3_CH2)
+ */
+#define M1_ENA_PORT       GPIOA
+#define M1_ENA_PIN        GPIO_PIN_8
+#define M1_IN1_PORT       GPIOB
+#define M1_IN1_PIN        GPIO_PIN_14
+#define M1_IN2_PORT       GPIOB
+#define M1_IN2_PIN        GPIO_PIN_15
+#define M1_PWM_PERIOD     999U
+#define M1_US1_START_CM   30.0f
+#define M1_US1_FULL_CM     8.0f
+#define M1_DUTY_MIN       250U
+#define M1_DUTY_MAX       999U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -358,6 +373,35 @@ static void alert_update(uint16_t ir_raw, float us5_cm, float us6_cm)
                             &us6_led_toggle_ms,
                             &us6_led_state);
 }
+
+  static void motor1_set_pwm(uint32_t ch1, uint32_t ch2)
+  {
+    if (ch1 > M1_PWM_PERIOD)
+    {
+      ch1 = M1_PWM_PERIOD;
+    }
+
+    if (ch2 > M1_PWM_PERIOD)
+    {
+      ch2 = M1_PWM_PERIOD;
+    }
+
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, ch1);
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, ch2);
+  }
+
+  static void motor1_update_from_us1(float us1_cm)
+  {
+    (void)us1_cm;
+
+    /* Enable motor driver and set forward direction on IN1/IN2. */
+    HAL_GPIO_WritePin(M1_ENA_PORT, M1_ENA_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(M1_IN1_PORT, M1_IN1_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(M1_IN2_PORT, M1_IN2_PIN, GPIO_PIN_RESET);
+
+    /* Debug mode: force motor always ON at maximum duty. */
+    motor1_set_pwm(M1_DUTY_MAX, 0U);
+  }
 /* USER CODE END 0 */
 
 /**
@@ -405,6 +449,9 @@ int main(void)
 #endif
 
   HAL_UART_Transmit(&huart2, (uint8_t *)boot_msg, sizeof(boot_msg) - 1U, HAL_MAX_DELAY);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+  motor1_set_pwm(0U, 0U);
   DWT_Init();
   setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -435,6 +482,7 @@ int main(void)
     uint16_t ir = read_ir();
     uint8_t whoami = imu_whoami();
 
+    motor1_update_from_us1(d1);
     alert_update(ir, d5, d6);
 
     const char *imu_status;
@@ -742,6 +790,9 @@ static void MX_GPIO_Init(void)
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_13,                                   GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(M1_ENA_PORT, M1_ENA_PIN,                              GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(M1_IN1_PORT, M1_IN1_PIN,                              GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(M1_IN2_PORT, M1_IN2_PIN,                              GPIO_PIN_RESET);
   /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
