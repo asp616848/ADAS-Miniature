@@ -29,6 +29,11 @@
 #define US_MIN_CM       2.0f
 #define US_MAX_CM       300.0f
 #define US_GAP_MS       25U
+#define IR_ALERT_TH     1000U
+#define US_ALERT_START_CM 20.0f
+#define US_ALERT_FULL_CM  5.0f
+#define US_BEEP_SLOW_MS   400U
+#define US_BEEP_FAST_MS    80U
 
 /* Peripheral handles – defined here, shared via main.h extern declarations */
 UART_HandleTypeDef huart2;
@@ -202,6 +207,64 @@ uint8_t imu_whoami(void)
 
     return data;
 }
+
+static float min_valid_distance_cm(float d1, float d2, float d3, float d4, float d5, float d6)
+{
+    float min_cm = -1.0f;
+    float values[6] = { d1, d2, d3, d4, d5, d6 };
+
+    for (uint32_t i = 0U; i < 6U; i++)
+    {
+        if (values[i] >= US_MIN_CM)
+        {
+            if ((min_cm < 0.0f) || (values[i] < min_cm))
+            {
+                min_cm = values[i];
+            }
+        }
+    }
+
+    return min_cm;
+}
+
+static void buzzer_update(uint16_t ir_raw, float min_us_cm)
+{
+    static uint32_t last_toggle_ms = 0U;
+    static GPIO_PinState buzzer_state = GPIO_PIN_RESET;
+    uint32_t now_ms = HAL_GetTick();
+
+    if ((ir_raw != 0xFFFFU) && (ir_raw < IR_ALERT_TH))
+    {
+        buzzer_state = GPIO_PIN_SET;
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, buzzer_state);
+        return;
+    }
+
+    if ((min_us_cm < 0.0f) || (min_us_cm > US_ALERT_START_CM))
+    {
+        buzzer_state = GPIO_PIN_RESET;
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, buzzer_state);
+        last_toggle_ms = now_ms;
+        return;
+    }
+
+    if (min_us_cm < US_ALERT_FULL_CM)
+    {
+        min_us_cm = US_ALERT_FULL_CM;
+    }
+
+    /* Distance 20->5 cm maps to beep period 400->80 ms (closer = faster beep). */
+    float ratio = (US_ALERT_START_CM - min_us_cm) / (US_ALERT_START_CM - US_ALERT_FULL_CM);
+    uint32_t period_ms = (uint32_t)(US_BEEP_SLOW_MS - (ratio * (float)(US_BEEP_SLOW_MS - US_BEEP_FAST_MS)));
+    uint32_t half_period_ms = period_ms / 2U;
+
+    if ((now_ms - last_toggle_ms) >= half_period_ms)
+    {
+        buzzer_state = (buzzer_state == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, buzzer_state);
+        last_toggle_ms = now_ms;
+    }
+}
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
@@ -271,6 +334,7 @@ static void MX_GPIO_Init(void)
     /* Pre-clear all TRIG outputs */
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_3|GPIO_PIN_5, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_10,                       GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8,                                    GPIO_PIN_RESET);
 
     /* ── GPIOA ──
        PA1  = ADC1_IN1  (analog – configured in HAL_ADC_MspInit)
@@ -298,6 +362,13 @@ static void MX_GPIO_Init(void)
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
     GPIO_InitStruct.Pull = GPIO_PULLDOWN;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+     /* PB8 = buzzer output (push-pull) */
+     GPIO_InitStruct.Pin   = GPIO_PIN_8;
+     GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+     GPIO_InitStruct.Pull  = GPIO_NOPULL;
+     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
     /* PB6/PB7 = I2C1_SCL/SDA – configured in HAL_I2C_MspInit */
 
@@ -445,6 +516,12 @@ int main(void)
         /* Check IMU identity */
         uint8_t whoami = imu_whoami();
 
+        /* Proximity for ultrasonic buzzer ramp logic */
+        float min_us_cm = min_valid_distance_cm(d1, d2, d3, d4, d5, d6);
+
+        /* Update buzzer: IR threshold override, else ultrasonic proximity beeping. */
+        buzzer_update(ir, min_us_cm);
+
         const char *imu_status;
         if (whoami == 0x68)
         {
@@ -478,20 +555,7 @@ int main(void)
             (unsigned int)imu_i2c_addr,
             imu_status
         );
-        /* ================== ADD THIS PART ================== */
-
-    // Simple buzzer toggle
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
-    HAL_Delay(200);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
-
-    // Extra UART debug (optional)
-    char msg[] = "Loop running\r\n";
-    HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
-
-    /* =================================================== */
-
-        HAL_Delay(500);  /* 2 Hz update rate */
+        HAL_Delay(80);  /* Keep loop responsive for buzzer ramp updates */
     }
 }
 
