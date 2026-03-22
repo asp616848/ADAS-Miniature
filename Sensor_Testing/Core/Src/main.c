@@ -14,7 +14,8 @@
  *   IMU  SCL=PB6  SDA=PB7  (I2C1)
  *   UART TX=PA2  (USART2)
  *   BUZZER CTRL=PB8
- *   ALERT LED =PB12
+ *   ALERT LED (US5 + IR)=PB12
+ *   ALERT LED2 (US6)    =PA13
  * ============================================================ */
 
 /* ─── 1. Includes ─────────────────────────────────────────── */
@@ -85,6 +86,8 @@ int _write(int file, char *ptr, int len)
 #define BUZZER_PIN     GPIO_PIN_8
 #define ALERT_LED_PORT GPIOB
 #define ALERT_LED_PIN  GPIO_PIN_12
+#define ALERT_LED2_PORT GPIOA
+#define ALERT_LED2_PIN  GPIO_PIN_13
 
 /* ─── 4. Microsecond delay (DWT cycle counter) ────────────── */
 void DWT_Init(void)
@@ -215,12 +218,12 @@ uint8_t imu_whoami(void)
     return data;
 }
 
-static float min_valid_distance_cm(float d1, float d2, float d3, float d4, float d5, float d6)
+static float min_valid_distance_cm2(float d1, float d2)
 {
     float min_cm = -1.0f;
-    float values[6] = { d1, d2, d3, d4, d5, d6 };
+    float values[2] = { d1, d2 };
 
-    for (uint32_t i = 0U; i < 6U; i++)
+    for (uint32_t i = 0U; i < 2U; i++)
     {
         if (values[i] >= US_MIN_CM)
         {
@@ -234,46 +237,93 @@ static float min_valid_distance_cm(float d1, float d2, float d3, float d4, float
     return min_cm;
 }
 
-static void buzzer_update(uint16_t ir_raw, float min_us_cm)
+static void update_proximity_output(float us_cm,
+                                    GPIO_TypeDef *port,
+                                    uint16_t pin,
+                                    uint32_t now_ms,
+                                    uint32_t *last_toggle_ms,
+                                    GPIO_PinState *state)
 {
-    static uint32_t last_toggle_ms = 0U;
-    static GPIO_PinState buzzer_state = GPIO_PIN_RESET;
-    uint32_t now_ms = HAL_GetTick();
-
-    if ((ir_raw != 0xFFFFU) && (ir_raw < IR_ALERT_TH))
+    if ((us_cm < 0.0f) || (us_cm > US_ALERT_START_CM))
     {
-        buzzer_state = GPIO_PIN_SET;
-        HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, buzzer_state);
-        HAL_GPIO_WritePin(ALERT_LED_PORT, ALERT_LED_PIN, buzzer_state);
+        *state = GPIO_PIN_RESET;
+        HAL_GPIO_WritePin(port, pin, *state);
+        *last_toggle_ms = now_ms;
         return;
     }
 
-    if ((min_us_cm < 0.0f) || (min_us_cm > US_ALERT_START_CM))
+    if (us_cm <= US_ALERT_FULL_CM)
     {
-        buzzer_state = GPIO_PIN_RESET;
-        HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, buzzer_state);
-        HAL_GPIO_WritePin(ALERT_LED_PORT, ALERT_LED_PIN, buzzer_state);
-        last_toggle_ms = now_ms;
+        *state = GPIO_PIN_SET;
+        HAL_GPIO_WritePin(port, pin, *state);
         return;
-    }
-
-    if (min_us_cm < US_ALERT_FULL_CM)
-    {
-        min_us_cm = US_ALERT_FULL_CM;
     }
 
     /* Distance 20->5 cm maps to beep period 400->80 ms (closer = faster beep). */
-    float ratio = (US_ALERT_START_CM - min_us_cm) / (US_ALERT_START_CM - US_ALERT_FULL_CM);
+    float ratio = (US_ALERT_START_CM - us_cm) / (US_ALERT_START_CM - US_ALERT_FULL_CM);
     uint32_t period_ms = (uint32_t)(US_BEEP_SLOW_MS - (ratio * (float)(US_BEEP_SLOW_MS - US_BEEP_FAST_MS)));
     uint32_t half_period_ms = period_ms / 2U;
 
-    if ((now_ms - last_toggle_ms) >= half_period_ms)
+    if ((now_ms - *last_toggle_ms) >= half_period_ms)
     {
-        buzzer_state = (buzzer_state == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
-        HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, buzzer_state);
-        HAL_GPIO_WritePin(ALERT_LED_PORT, ALERT_LED_PIN, buzzer_state);
-        last_toggle_ms = now_ms;
+        *state = (*state == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
+        HAL_GPIO_WritePin(port, pin, *state);
+        *last_toggle_ms = now_ms;
     }
+}
+
+static void alert_update(uint16_t ir_raw, float us5_cm, float us6_cm)
+{
+    static uint32_t buzzer_toggle_ms = 0U;
+    static uint32_t us5_led_toggle_ms = 0U;
+    static uint32_t us6_led_toggle_ms = 0U;
+    static GPIO_PinState buzzer_state = GPIO_PIN_RESET;
+    static GPIO_PinState us5_led_state = GPIO_PIN_RESET;
+    static GPIO_PinState us6_led_state = GPIO_PIN_RESET;
+    uint32_t now_ms = HAL_GetTick();
+
+    /* Keep existing IR behavior: IR alert forces buzzer + existing LED ON. */
+    if ((ir_raw != 0xFFFFU) && (ir_raw < IR_ALERT_TH))
+    {
+        buzzer_state = GPIO_PIN_SET;
+        us5_led_state = GPIO_PIN_SET;
+        HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, buzzer_state);
+        HAL_GPIO_WritePin(ALERT_LED_PORT, ALERT_LED_PIN, us5_led_state);
+
+        /* US6 has its own LED indication channel. */
+        update_proximity_output(us6_cm,
+                                ALERT_LED2_PORT,
+                                ALERT_LED2_PIN,
+                                now_ms,
+                                &us6_led_toggle_ms,
+                                &us6_led_state);
+        return;
+    }
+
+    /* Buzzer frequency follows closest of US5/US6 only. */
+    float min_us_cm = min_valid_distance_cm2(us5_cm, us6_cm);
+    update_proximity_output(min_us_cm,
+                            BUZZER_PORT,
+                            BUZZER_PIN,
+                            now_ms,
+                            &buzzer_toggle_ms,
+                            &buzzer_state);
+
+    /* Existing LED tracks US5 channel. */
+    update_proximity_output(us5_cm,
+                            ALERT_LED_PORT,
+                            ALERT_LED_PIN,
+                            now_ms,
+                            &us5_led_toggle_ms,
+                            &us5_led_state);
+
+    /* New LED tracks US6 channel. */
+    update_proximity_output(us6_cm,
+                            ALERT_LED2_PORT,
+                            ALERT_LED2_PIN,
+                            now_ms,
+                            &us6_led_toggle_ms,
+                            &us6_led_state);
 }
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
@@ -345,6 +395,7 @@ static void MX_GPIO_Init(void)
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_3|GPIO_PIN_5, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_10,                       GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8|GPIO_PIN_12,                        GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_13,                                   GPIO_PIN_RESET);
 
     /* ── GPIOA ──
        PA1  = ADC1_IN1  (analog – configured in HAL_ADC_MspInit)
@@ -357,7 +408,14 @@ static void MX_GPIO_Init(void)
     GPIO_InitStruct.Pull = GPIO_PULLDOWN;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    /* ── GPIOB ──
+     /* PA13 = alert LED2 (US6) */
+     GPIO_InitStruct.Pin   = GPIO_PIN_13;
+     GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+     GPIO_InitStruct.Pull  = GPIO_NOPULL;
+     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+     /* ── GPIOB ──
        PB0  = US5_TRIG  (output push-pull)
        PB10 = US6_TRIG  (output push-pull) */
     GPIO_InitStruct.Pin   = GPIO_PIN_0 | GPIO_PIN_10;
@@ -373,7 +431,7 @@ static void MX_GPIO_Init(void)
     GPIO_InitStruct.Pull = GPIO_PULLDOWN;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-    /* PB8 = buzzer output, PB12 = alert LED output (push-pull) */
+    /* PB8 = buzzer output, PB12 = alert LED (US5/IR) */
     GPIO_InitStruct.Pin   = GPIO_PIN_8 | GPIO_PIN_12;
      GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
      GPIO_InitStruct.Pull  = GPIO_NOPULL;
@@ -526,11 +584,8 @@ int main(void)
         /* Check IMU identity */
         uint8_t whoami = imu_whoami();
 
-        /* Proximity for ultrasonic buzzer ramp logic */
-        float min_us_cm = min_valid_distance_cm(d1, d2, d3, d4, d5, d6);
-
-        /* Update buzzer: IR threshold override, else ultrasonic proximity beeping. */
-        buzzer_update(ir, min_us_cm);
+        /* Alert update uses only US5/US6 for proximity + IR override. */
+        alert_update(ir, d5, d6);
 
         const char *imu_status;
         if (whoami == 0x68)
