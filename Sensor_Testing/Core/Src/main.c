@@ -287,16 +287,10 @@ static void alert_update(uint16_t ir_raw, float us5_cm, float us6_cm)
     {
         buzzer_state = GPIO_PIN_SET;
         us5_led_state = GPIO_PIN_SET;
+        us6_led_state = GPIO_PIN_SET;
         HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, buzzer_state);
         HAL_GPIO_WritePin(ALERT_LED_PORT, ALERT_LED_PIN, us5_led_state);
-
-        /* US6 has its own LED indication channel. */
-        update_proximity_output(us6_cm,
-                                ALERT_LED2_PORT,
-                                ALERT_LED2_PIN,
-                                now_ms,
-                                &us6_led_toggle_ms,
-                                &us6_led_state);
+        HAL_GPIO_WritePin(ALERT_LED2_PORT, ALERT_LED2_PIN, us6_led_state);
         return;
     }
 
