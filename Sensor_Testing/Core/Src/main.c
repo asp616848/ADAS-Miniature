@@ -13,6 +13,8 @@
  *   IR0  PA1  (ADC1_IN1)
  *   IMU  SCL=PB6  SDA=PB7  (I2C1)
  *   UART TX=PA2  (USART2)
+ *   BUZZER CTRL=PB8
+ *   ALERT LED =PB12
  * ============================================================ */
 
 /* ─── 1. Includes ─────────────────────────────────────────── */
@@ -78,6 +80,11 @@ int _write(int file, char *ptr, int len)
 #define US6_TRIG_PIN   GPIO_PIN_10
 #define US6_ECHO_PORT  GPIOB
 #define US6_ECHO_PIN   GPIO_PIN_11
+
+#define BUZZER_PORT    GPIOB
+#define BUZZER_PIN     GPIO_PIN_8
+#define ALERT_LED_PORT GPIOB
+#define ALERT_LED_PIN  GPIO_PIN_12
 
 /* ─── 4. Microsecond delay (DWT cycle counter) ────────────── */
 void DWT_Init(void)
@@ -236,14 +243,16 @@ static void buzzer_update(uint16_t ir_raw, float min_us_cm)
     if ((ir_raw != 0xFFFFU) && (ir_raw < IR_ALERT_TH))
     {
         buzzer_state = GPIO_PIN_SET;
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, buzzer_state);
+        HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, buzzer_state);
+        HAL_GPIO_WritePin(ALERT_LED_PORT, ALERT_LED_PIN, buzzer_state);
         return;
     }
 
     if ((min_us_cm < 0.0f) || (min_us_cm > US_ALERT_START_CM))
     {
         buzzer_state = GPIO_PIN_RESET;
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, buzzer_state);
+        HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, buzzer_state);
+        HAL_GPIO_WritePin(ALERT_LED_PORT, ALERT_LED_PIN, buzzer_state);
         last_toggle_ms = now_ms;
         return;
     }
@@ -261,7 +270,8 @@ static void buzzer_update(uint16_t ir_raw, float min_us_cm)
     if ((now_ms - last_toggle_ms) >= half_period_ms)
     {
         buzzer_state = (buzzer_state == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, buzzer_state);
+        HAL_GPIO_WritePin(BUZZER_PORT, BUZZER_PIN, buzzer_state);
+        HAL_GPIO_WritePin(ALERT_LED_PORT, ALERT_LED_PIN, buzzer_state);
         last_toggle_ms = now_ms;
     }
 }
@@ -334,7 +344,7 @@ static void MX_GPIO_Init(void)
     /* Pre-clear all TRIG outputs */
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_3|GPIO_PIN_5, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_10,                       GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8,                                    GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8|GPIO_PIN_12,                        GPIO_PIN_RESET);
 
     /* ── GPIOA ──
        PA1  = ADC1_IN1  (analog – configured in HAL_ADC_MspInit)
@@ -363,8 +373,8 @@ static void MX_GPIO_Init(void)
     GPIO_InitStruct.Pull = GPIO_PULLDOWN;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-     /* PB8 = buzzer output (push-pull) */
-     GPIO_InitStruct.Pin   = GPIO_PIN_8;
+    /* PB8 = buzzer output, PB12 = alert LED output (push-pull) */
+    GPIO_InitStruct.Pin   = GPIO_PIN_8 | GPIO_PIN_12;
      GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
      GPIO_InitStruct.Pull  = GPIO_NOPULL;
      GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
