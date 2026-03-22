@@ -479,6 +479,18 @@ int main(void)
             (unsigned int)imu_i2c_addr,
             imu_status
         );
+        /* ================== ADD THIS PART ================== */
+
+    // Simple buzzer toggle
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);
+    HAL_Delay(200);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);
+
+    // Extra UART debug (optional)
+    char msg[] = "Loop running\r\n";
+    HAL_UART_Transmit(&huart3, (uint8_t*)msg, strlen(msg), HAL_MAX_DELAY);
+
+    /* =================================================== */
 
         HAL_Delay(500);  /* 2 Hz update rate */
     }
