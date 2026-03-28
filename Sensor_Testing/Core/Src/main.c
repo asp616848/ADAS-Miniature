@@ -47,15 +47,19 @@
 #define US_BEEP_SLOW_MS   400U
 #define US_BEEP_FAST_MS    80U
 
-/* Motor-1 mapping
- * ENA -> PA8, IN1 -> PB14, IN2 -> PB15, C1 -> PA6(TIM3_CH1), C2 -> PA7(TIM3_CH2)
+/* Motor-1 mapping (UPDATED)
+ * ENA -> PA6, IN1 -> PB14, IN2 -> PB15, C1 -> PA8(TIM3_CH1), C2 -> PA7(TIM3_CH2)
  */
 #define M1_ENA_PORT       GPIOA
-#define M1_ENA_PIN        GPIO_PIN_8
+#define M1_ENA_PIN        GPIO_PIN_6
 #define M1_IN1_PORT       GPIOB
 #define M1_IN1_PIN        GPIO_PIN_14
 #define M1_IN2_PORT       GPIOB
 #define M1_IN2_PIN        GPIO_PIN_15
+#define M1_C1_PORT        GPIOA
+#define M1_C1_PIN         GPIO_PIN_8  /* TIM3_CH1 */
+#define M1_C2_PORT        GPIOA
+#define M1_C2_PIN         GPIO_PIN_7  /* TIM3_CH2 */
 #define M1_PWM_PERIOD     999U
 #define M1_US1_START_CM   30.0f
 #define M1_US1_FULL_CM     8.0f
@@ -374,34 +378,34 @@ static void alert_update(uint16_t ir_raw, float us5_cm, float us6_cm)
                             &us6_led_state);
 }
 
-  static void motor1_set_pwm(uint32_t ch1, uint32_t ch2)
-  {
-    if (ch1 > M1_PWM_PERIOD)
+
+static void motor1_set_pwm(uint32_t c1, uint32_t c2)
+{
+    if (c1 > M1_PWM_PERIOD)
     {
-      ch1 = M1_PWM_PERIOD;
+        c1 = M1_PWM_PERIOD;
     }
-
-    if (ch2 > M1_PWM_PERIOD)
+    if (c2 > M1_PWM_PERIOD)
     {
-      ch2 = M1_PWM_PERIOD;
+        c2 = M1_PWM_PERIOD;
     }
+    /* C1 = PA8 (TIM3_CH1), C2 = PA7 (TIM3_CH2) */
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, c1); // PA8
+    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, c2); // PA7
+}
 
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, ch1);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, ch2);
-  }
-
-  static void motor1_update_from_us1(float us1_cm)
-  {
+static void motor1_update_from_us1(float us1_cm)
+{
     (void)us1_cm;
 
     /* Enable motor driver and set forward direction on IN1/IN2. */
-    HAL_GPIO_WritePin(M1_ENA_PORT, M1_ENA_PIN, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(M1_ENA_PORT, M1_ENA_PIN, GPIO_PIN_SET); // PA6
     HAL_GPIO_WritePin(M1_IN1_PORT, M1_IN1_PIN, GPIO_PIN_SET);
     HAL_GPIO_WritePin(M1_IN2_PORT, M1_IN2_PIN, GPIO_PIN_RESET);
 
     /* Debug mode: force motor always ON at maximum duty. */
-    motor1_set_pwm(M1_DUTY_MAX, 0U);
-  }
+    motor1_set_pwm(M1_DUTY_MAX, 0U); // C1=PA8, C2=PA7
+}
 /* USER CODE END 0 */
 
 /**
