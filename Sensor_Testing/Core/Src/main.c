@@ -448,6 +448,17 @@ uint8_t imu_whoami(void)
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, pulse_us);
   }
 
+  static void servo_step_90deg_on_trigger(void)
+  {
+    /* 3-position stepping: 0° -> 90° -> 180° -> 0° ... */
+    static uint8_t pos = 0U;
+
+    pos = (uint8_t)((pos + 1U) % 3U);
+    if (pos == 0U)      servo_set_pulse_us(SERVO_LEFT_US);
+    else if (pos == 1U) servo_set_pulse_us(SERVO_CENTER_US);
+    else                servo_set_pulse_us(SERVO_RIGHT_US);
+  }
+
   static void servo_update_5s(void)
   {
     uint32_t now_ms = HAL_GetTick();
@@ -517,9 +528,17 @@ static void alert_update(uint16_t ir_raw, float us5_cm, float us6_cm)
     static GPIO_PinState buzzer_state    = GPIO_PIN_RESET;
     static GPIO_PinState us5_led_state   = GPIO_PIN_RESET;
     static GPIO_PinState us6_led_state   = GPIO_PIN_RESET;
+  static uint8_t     ir_prev_triggered = 0U;
     uint32_t now_ms = HAL_GetTick();
 
-    if ((ir_raw != 0xFFFFU) && (ir_raw < IR_ALERT_TH))
+  uint8_t ir_triggered = (uint8_t)((ir_raw != 0xFFFFU) && (ir_raw < IR_ALERT_TH));
+  if ((ir_triggered != 0U) && (ir_prev_triggered == 0U))
+  {
+    servo_step_90deg_on_trigger();
+  }
+  ir_prev_triggered = ir_triggered;
+
+  if (ir_triggered != 0U)
     {
         buzzer_state  = GPIO_PIN_SET;
         us5_led_state = GPIO_PIN_SET;
@@ -648,7 +667,6 @@ int main(void)
 
     motor1_update_from_us1(d1);
     motor2_always_on();
-  servo_update_5s();
     alert_update(ir, d5, d6);
 
     const char *imu_status;
