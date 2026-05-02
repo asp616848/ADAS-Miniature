@@ -37,6 +37,7 @@
 #define I2C_BIT_DELAY_US 5U
 #define IMU_ADDR_68     (0x68U << 1)
 #define IMU_ADDR_69     (0x69U << 1)
+#define IMU_SOFT_I2C_ENABLE 0
 #define US_MIN_CM       2.0f
 #define US_MAX_CM       300.0f
 #define US_GAP_MS       25U
@@ -102,13 +103,11 @@ I2C_HandleTypeDef hi2c1;
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim3;
 
-UART_HandleTypeDef huart3;
+UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 static uint16_t imu_i2c_addr = 0U;
 static uint16_t servo_pulse_us = SERVO_LEFT_US;
-static uint32_t servo_last_step_ms = 0U;
-static uint8_t servo_at_left = 1U;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -117,8 +116,8 @@ static void MX_GPIO_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_I2C1_Init(void);
-static void MX_USART3_UART_Init(void);
 static void MX_TIM1_Init(void);
+static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -130,15 +129,23 @@ static void MX_TIM1_Init(void);
 int _write(int file, char *ptr, int len)
 {
   (void)file;
-  HAL_UART_Transmit(&huart3, (uint8_t*)ptr, (uint16_t)len, HAL_MAX_DELAY);
-    return len;
+  (void)HAL_UART_Transmit(&huart2, (uint8_t*)ptr, (uint16_t)len, 100U);
+  return len;
 }
 
-/* IMU software-I2C pins (as requested): SDA=PA2, SCL=PA3 */
+static void uart2_tx_str(const char *s)
+{
+  if (s == NULL) return;
+  (void)HAL_UART_Transmit(&huart2, (uint8_t*)s, (uint16_t)strlen(s), 100U);
+}
+
+#if IMU_SOFT_I2C_ENABLE
+/* IMU software-I2C pins (NOTE: PA2/PA3 conflict with USART2 if enabled) */
 #define IMU_SDA_PORT GPIOA
 #define IMU_SDA_PIN  GPIO_PIN_2
 #define IMU_SCL_PORT GPIOA
 #define IMU_SCL_PIN  GPIO_PIN_3
+#endif
 
 /* Ultrasonic pin definitions */
 #define US1_TRIG_PORT  GPIOC
@@ -174,9 +181,9 @@ int _write(int file, char *ptr, int len)
 #define BUZZER_PORT     GPIOB
 #define BUZZER_PIN      GPIO_PIN_8
 #define ALERT_LED_PORT  GPIOB
-#define ALERT_LED_PIN   GPIO_PIN_12
-#define ALERT_LED2_PORT GPIOA
-#define ALERT_LED2_PIN  GPIO_PIN_13
+#define ALERT_LED_PIN   GPIO_PIN_9
+#define ALERT_LED2_PORT GPIOB
+#define ALERT_LED2_PIN  GPIO_PIN_12
 
 /* Microsecond delay via DWT */
 void DWT_Init(void)
@@ -235,6 +242,7 @@ uint16_t read_ir(void)
     return (uint16_t)HAL_ADC_GetValue(&hadc1);
 }
 
+#if IMU_SOFT_I2C_ENABLE
 /* IMU MPU6050 */
 static void imu_sda_write(GPIO_PinState state)
 {
@@ -415,6 +423,7 @@ uint8_t imu_whoami(void)
 
     return data;
 }
+#endif /* IMU_SOFT_I2C_ENABLE */
 
   static void servo_config_50hz_1us_ticks(void)
   {
@@ -448,26 +457,30 @@ uint8_t imu_whoami(void)
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, pulse_us);
   }
 
-  static void servo_step_90deg_on_trigger(void)
+  static void servo_update_pattern(void)
   {
-    /* 3-position stepping: 0° -> 90° -> 180° -> 0° ... */
-    static uint8_t pos = 0U;
-
-    pos = (uint8_t)((pos + 1U) % 3U);
-    if (pos == 0U)      servo_set_pulse_us(SERVO_LEFT_US);
-    else if (pos == 1U) servo_set_pulse_us(SERVO_CENTER_US);
-    else                servo_set_pulse_us(SERVO_RIGHT_US);
-  }
-
-  static void servo_update_5s(void)
-  {
+    /* Simple pattern: 45° (left) -> 135° (right) -> 90° (center) -> hold */
     uint32_t now_ms = HAL_GetTick();
+    static uint32_t start_ms = 0U;
+    static uint8_t pattern_done = 0U;
 
-    if ((now_ms - servo_last_step_ms) >= SERVO_SWEEP_MS)
+    if (pattern_done != 0U) return;  /* Pattern complete, servo stays at center */
+
+    if (start_ms == 0U) start_ms = now_ms;
+    uint32_t elapsed = now_ms - start_ms;
+
+    if (elapsed < 2000U)
     {
-      servo_at_left = (uint8_t)(1U - servo_at_left);
-      servo_set_pulse_us(servo_at_left ? SERVO_LEFT_US : SERVO_RIGHT_US);
-      servo_last_step_ms = now_ms;
+      servo_set_pulse_us(SERVO_LEFT_US);      /* 45° = 1000us */
+    }
+    else if (elapsed < 4000U)
+    {
+      servo_set_pulse_us(SERVO_RIGHT_US);     /* 135° = 2000us */
+    }
+    else
+    {
+      servo_set_pulse_us(SERVO_CENTER_US);    /* 90° = 1500us */
+      pattern_done = 1U;                      /* Stop pattern, hold center */
     }
   }
 
@@ -534,7 +547,7 @@ static void alert_update(uint16_t ir_raw, float us5_cm, float us6_cm)
   uint8_t ir_triggered = (uint8_t)((ir_raw != 0xFFFFU) && (ir_raw < IR_ALERT_TH));
   if ((ir_triggered != 0U) && (ir_prev_triggered == 0U))
   {
-    servo_step_90deg_on_trigger();
+    /* IR detected - servo is controlled by servo_update_pattern() */
   }
   ir_prev_triggered = ir_triggered;
 
@@ -589,109 +602,81 @@ static void motor2_always_on(void)
   */
 int main(void)
 {
-
   /* USER CODE BEGIN 1 */
+
   /* USER CODE END 1 */
 
-  /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
   SystemClock_Config();
 
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
-  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_ADC1_Init();
-  MX_TIM3_Init();
   MX_I2C1_Init();
-  MX_USART3_UART_Init();
   MX_TIM1_Init();
+  MX_TIM3_Init();
+  MX_USART2_UART_Init();
+
   /* USER CODE BEGIN 2 */
-#if UART_DEBUG_ONLY
-  while (1)
-  {
-    printf("UART DEBUG: hello from NUCLEO-F103RB\r\n");
-    HAL_Delay(1000);
-  }
-#endif
-
-  imu_soft_i2c_gpio_init();
-
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
-  motor1_set_pwm(0U, 0U);
+  DWT_Init();
+  DWT->CYCCNT = 0U;
 
   servo_config_50hz_1us_ticks();
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
+  (void)HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
   servo_set_pulse_us(SERVO_LEFT_US);
-  servo_last_step_ms = HAL_GetTick();
-  servo_at_left = 1U;
 
-  DWT_Init();
-  setvbuf(stdout, NULL, _IONBF, 0);
+  (void)HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  (void)HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
 
-  printf("\r\n=== STM32F103RB Sensor Bring-Up Test ===\r\n");
-  printf("US1-US6 | IR (ADC) | IMU WHO_AM_I | SERVO\r\n");
-  printf("----------------------------------------\r\n");
-  i2c_scan_print();
+  motor2_always_on();
+  motor1_update_from_us1(-1.0f);
+
+  uart2_tx_str("BOOT\r\n");
+  printf("USART2 OK (PA2=TX, PA3=RX)\r\n");
   /* USER CODE END 2 */
 
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
   while (1)
   {
-    float d1 = ultrasonic_read(US1_TRIG_PORT, US1_TRIG_PIN, US1_ECHO_PORT, US1_ECHO_PIN);
+    uint16_t ir_raw = read_ir();
+    float us1_cm = ultrasonic_read(US1_TRIG_PORT, US1_TRIG_PIN, US1_ECHO_PORT, US1_ECHO_PIN);
     HAL_Delay(US_GAP_MS);
-    float d2 = ultrasonic_read(US2_TRIG_PORT, US2_TRIG_PIN, US2_ECHO_PORT, US2_ECHO_PIN);
+    float us2_cm = ultrasonic_read(US2_TRIG_PORT, US2_TRIG_PIN, US2_ECHO_PORT, US2_ECHO_PIN);
     HAL_Delay(US_GAP_MS);
-    float d3 = ultrasonic_read(US3_TRIG_PORT, US3_TRIG_PIN, US3_ECHO_PORT, US3_ECHO_PIN);
+    float us3_cm = ultrasonic_read(US3_TRIG_PORT, US3_TRIG_PIN, US3_ECHO_PORT, US3_ECHO_PIN);
     HAL_Delay(US_GAP_MS);
-    float d4 = ultrasonic_read(US4_TRIG_PORT, US4_TRIG_PIN, US4_ECHO_PORT, US4_ECHO_PIN);
+    float us4_cm = ultrasonic_read(US4_TRIG_PORT, US4_TRIG_PIN, US4_ECHO_PORT, US4_ECHO_PIN);
     HAL_Delay(US_GAP_MS);
-    float d5 = ultrasonic_read(US5_TRIG_PORT, US5_TRIG_PIN, US5_ECHO_PORT, US5_ECHO_PIN);
+    float us5_cm = ultrasonic_read(US5_TRIG_PORT, US5_TRIG_PIN, US5_ECHO_PORT, US5_ECHO_PIN);
     HAL_Delay(US_GAP_MS);
-    float d6 = ultrasonic_read(US6_TRIG_PORT, US6_TRIG_PIN, US6_ECHO_PORT, US6_ECHO_PIN);
+    float us6_cm = ultrasonic_read(US6_TRIG_PORT, US6_TRIG_PIN, US6_ECHO_PORT, US6_ECHO_PIN);
+    HAL_Delay(US_GAP_MS);
 
-    uint16_t ir     = read_ir();
-    uint8_t  whoami = imu_whoami();
+    alert_update(ir_raw, us5_cm, us6_cm);
+    servo_update_pattern();
 
-    motor1_update_from_us1(d1);
-    motor2_always_on();
-    alert_update(ir, d5, d6);
-
-    const char *imu_status;
-    if      (whoami == 0x68) imu_status = " [OK]";
-    else if (whoami == 0xFF) imu_status = " [NO DEVICE 0x68/0x69]";
-    else if (whoami == 0xFE) imu_status = " [I2C READ ERROR]";
-    else                     imu_status = " [WHO_AM_I MISMATCH]";
-
-    printf(
-      "US(cm): %3d.%d %3d.%d %3d.%d %3d.%d %3d.%d %3d.%d | IR: %4u | IMU: 0x%02X @0x%02X%s | SERVO:%4uus\r\n",
-      (int)d1, (int)(d1 * 10.0f) % 10,
-      (int)d2, (int)(d2 * 10.0f) % 10,
-      (int)d3, (int)(d3 * 10.0f) % 10,
-      (int)d4, (int)(d4 * 10.0f) % 10,
-      (int)d5, (int)(d5 * 10.0f) % 10,
-      (int)d6, (int)(d6 * 10.0f) % 10,
-      ir, whoami, (unsigned int)imu_i2c_addr, imu_status, (unsigned int)servo_pulse_us
-    );
-
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
-    HAL_Delay(80);
+    {
+      static uint32_t last_print_ms = 0U;
+      uint32_t now_ms = HAL_GetTick();
+      if ((now_ms - last_print_ms) >= 500U)
+      {
+        int us1_x10 = (us1_cm < 0.0f) ? -1 : (int)(us1_cm * 10.0f);
+        int us2_x10 = (us2_cm < 0.0f) ? -1 : (int)(us2_cm * 10.0f);
+        int us3_x10 = (us3_cm < 0.0f) ? -1 : (int)(us3_cm * 10.0f);
+        int us4_x10 = (us4_cm < 0.0f) ? -1 : (int)(us4_cm * 10.0f);
+        int us5_x10 = (us5_cm < 0.0f) ? -1 : (int)(us5_cm * 10.0f);
+        int us6_x10 = (us6_cm < 0.0f) ? -1 : (int)(us6_cm * 10.0f);
+        
+        printf("IR=%u U1=%d.%d U2=%d.%d U3=%d.%d U4=%d.%d U5=%d.%d U6=%d.%d\r\n",
+               (unsigned int)ir_raw,
+               us1_x10 / 10, (us1_x10 < 0) ? 0 : (us1_x10 % 10),
+               us2_x10 / 10, (us2_x10 < 0) ? 0 : (us2_x10 % 10),
+               us3_x10 / 10, (us3_x10 < 0) ? 0 : (us3_x10 % 10),
+               us4_x10 / 10, (us4_x10 < 0) ? 0 : (us4_x10 % 10),
+               us5_x10 / 10, (us5_x10 < 0) ? 0 : (us5_x10 % 10),
+               us6_x10 / 10, (us6_x10 < 0) ? 0 : (us6_x10 % 10));
+        last_print_ms = now_ms;
+      }
+    }
   }
-  /* USER CODE END 3 */
 }
 
 /**
@@ -773,9 +758,9 @@ static void MX_ADC1_Init(void)
 
   /** Configure Regular Channel
   */
-  sConfig.Channel = ADC_CHANNEL_14;  // ir from pa1 to pc4
+  sConfig.Channel = ADC_CHANNEL_14;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_71CYCLES_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -958,35 +943,35 @@ static void MX_TIM3_Init(void)
 }
 
 /**
-  * @brief USART3 Initialization Function
+  * @brief USART2 Initialization Function
   * @param None
   * @retval None
   */
-static void MX_USART3_UART_Init(void)
+static void MX_USART2_UART_Init(void)
 {
 
-  /* USER CODE BEGIN USART3_Init 0 */
+  /* USER CODE BEGIN USART2_Init 0 */
 
-  /* USER CODE END USART3_Init 0 */
+  /* USER CODE END USART2_Init 0 */
 
-  /* USER CODE BEGIN USART3_Init 1 */
+  /* USER CODE BEGIN USART2_Init 1 */
 
-  /* USER CODE END USART3_Init 1 */
-  huart3.Instance = USART3;
-  huart3.Init.BaudRate = 115200;
-  huart3.Init.WordLength = UART_WORDLENGTH_8B;
-  huart3.Init.StopBits = UART_STOPBITS_1;
-  huart3.Init.Parity = UART_PARITY_NONE;
-  huart3.Init.Mode = UART_MODE_TX_RX;
-  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart3) != HAL_OK)
+  /* USER CODE END USART2_Init 1 */
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = 115200;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USART3_Init 2 */
+  /* USER CODE BEGIN USART2_Init 2 */
 
-  /* USER CODE END USART3_Init 2 */
+  /* USER CODE END USART2_Init 2 */
 
 }
 
@@ -1008,11 +993,6 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(M2_IN4_PORT, M2_IN4_PIN, GPIO_PIN_RESET);
   /* USER CODE END MX_GPIO_Init_1 */
 
-  // pc4 setup 
-  GPIO_InitStruct.Pin = GPIO_PIN_4;
-  GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
@@ -1023,14 +1003,11 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_3|GPIO_PIN_5, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_3, GPIO_PIN_SET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_10|GPIO_PIN_12|GPIO_PIN_13
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_12|GPIO_PIN_13
                           |GPIO_PIN_14|GPIO_PIN_15|GPIO_PIN_8, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8|GPIO_PIN_13, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
@@ -1045,28 +1022,15 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : PA2 */
-  GPIO_InitStruct.Pin = GPIO_PIN_2;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : PA3 PA8 PA13 */
-  GPIO_InitStruct.Pin = GPIO_PIN_3|GPIO_PIN_8|GPIO_PIN_13;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
   /*Configure GPIO pins : PA4 PA5 */
   GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_5;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PB0 PB10 PB12 PB13
+  /*Configure GPIO pins : PB0 PB9 PB10 PB12 PB13
                            PB14 PB15 PB8 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_10|GPIO_PIN_12|GPIO_PIN_13
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_12|GPIO_PIN_13
                           |GPIO_PIN_14|GPIO_PIN_15|GPIO_PIN_8;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -1091,6 +1055,13 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
+  /*Configure GPIO pin : PA8 */
+  GPIO_InitStruct.Pin = GPIO_PIN_8;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
   /*Configure GPIO pin : PA9 */
   GPIO_InitStruct.Pin = GPIO_PIN_9;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
@@ -1103,19 +1074,18 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+  /*Configure GPIO pins : PC10 PC11 */
+  GPIO_InitStruct.Pin = GPIO_PIN_10|GPIO_PIN_11;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
   /* EXTI interrupt init*/
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-  /* Force PA2/PA3 into software-I2C mode for IMU and restore motor2 direction pins as outputs. */
-  GPIO_InitStruct.Pin = IMU_SDA_PIN | IMU_SCL_PIN;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-  HAL_GPIO_WritePin(GPIOA, IMU_SDA_PIN | IMU_SCL_PIN, GPIO_PIN_SET);
-
+  /* Restore motor2 direction pins (PC7/PC8) as outputs (CubeMX may regenerate them differently). */
   GPIO_InitStruct.Pin = GPIO_PIN_7 | GPIO_PIN_8;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
