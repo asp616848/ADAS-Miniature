@@ -80,17 +80,7 @@
 #define DUTY_SLOW            350U
 
 /* Navigation thresholds (cm) */
-#define NAV_CRITICAL_CM       6.0f    /* Emergency brake */
-#define NAV_FRONT_STOP_CM    25.0f    /* Trigger turn decision */
-#define NAV_FRONT_WARN_CM    40.0f    /* Start slowing */
-#define NAV_SIDE_WARN_CM     15.0f    /* Steer away from wall */
-#define NAV_REAR_STOP_CM     18.0f    /* Stop reversing */
-
-/* Navigation timing (ms) */
-#define PIVOT_MIN_MS         600U     /* Minimum pivot before checking clear */
-#define PIVOT_MAX_MS        1800U     /* Give up pivoting → go backward */
-#define BACKUP_MS            900U     /* Reverse duration */
-#define STOP_ASSESS_MS       350U     /* Pause before reassessing */
+#define NAV_BRAKE_CM        30.0f    /* Brake threshold for front/rear */
 
 /* Ultrasonic pins */
 #define US1_TRIG_PORT  GPIOC
@@ -144,9 +134,7 @@ UART_HandleTypeDef  huart2;
    NAVIGATION STATE
    ===================================================================== */
 typedef enum {
-    NAV_FORWARD     = 0,
-    NAV_PIVOT_LEFT,     /* spin CCW: M1 back, M2 fwd */
-    NAV_PIVOT_RIGHT,    /* spin CW : M1 fwd, M2 back */
+    NAV_FORWARD  = 0,
     NAV_BACKWARD,
     NAV_STOP,
 } NavState_t;
@@ -339,101 +327,41 @@ static void motors_steer_left(void)   { m1_forward(DUTY_SLOW);  m2_forward(); }
 static void motors_steer_right(void)  { m1_forward(DUTY_FULL);  m2_stop();    }
 
 /* =====================================================================
-   LED / BUZZER — state-aware, non-blocking
+   LED / BUZZER — simplified for emergency braking test
    ===================================================================== */
-static void alert_update(NavState_t state, float us5_cm, float us6_cm, uint16_t ir_raw)
+static void alert_update(NavState_t state)
 {
     static uint32_t     last_tog   = 0U;
     static GPIO_PinState led1      = GPIO_PIN_RESET;
     static GPIO_PinState led2      = GPIO_PIN_RESET;
     static GPIO_PinState buz       = GPIO_PIN_RESET;
 
-    uint32_t now    = HAL_GetTick();
-    uint8_t  ir_on  = (ir_raw != 0xFFFFU) && (ir_raw < IR_ALERT_TH);
-    float    s5     = nav_cm(us5_cm);
-    float    s6     = nav_cm(us6_cm);
-    float    rear   = (s5 < s6) ? s5 : s6;
-
-    /* ---- PRIORITY 1: IR object or critical rear → solid on ---- */
-    if (ir_on || (rear < NAV_CRITICAL_CM)) {
-        led1 = led2 = buz = GPIO_PIN_SET;
-        HAL_GPIO_WritePin(BUZZER_PORT,     BUZZER_PIN,     buz);
-        HAL_GPIO_WritePin(ALERT_LED_PORT,  ALERT_LED_PIN,  led1);
-        HAL_GPIO_WritePin(ALERT_LED2_PORT, ALERT_LED2_PIN, led2);
-        return;
-    }
-
-    uint32_t half_ms = 0U;   /* toggle half-period; 0 = no toggle this state */
+    uint32_t now = HAL_GetTick();
 
     switch (state) {
 
     case NAV_FORWARD:
-        /* Rear proximity buzzer — louder/faster as object approaches */
-        if (rear < NAV_REAR_STOP_CM) {
-            float ratio = 1.0f - ((rear - NAV_CRITICAL_CM) /
-                                  (NAV_REAR_STOP_CM - NAV_CRITICAL_CM));
-            if (ratio < 0.0f) ratio = 0.0f;
-            if (ratio > 1.0f) ratio = 1.0f;
-            half_ms = (uint32_t)(350U - ratio * 270.0f);   /* 80 – 350 ms */
-            /* Buzzer follows blink; LEDs show which rear sensor */
-            if ((now - last_tog) >= half_ms) {
-                led1 = (s5 < NAV_REAR_STOP_CM) ?
-                       ((led1 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET) : GPIO_PIN_RESET;
-                led2 = (s6 < NAV_REAR_STOP_CM) ?
-                       ((led2 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET) : GPIO_PIN_RESET;
-                buz  = (led1 == GPIO_PIN_SET) || (led2 == GPIO_PIN_SET) ?
-                       GPIO_PIN_SET : GPIO_PIN_RESET;
-                last_tog = now;
-            }
-        } else {
-            /* Slow heartbeat: both LEDs gentle pulse, buzzer off */
-            half_ms = 500U;
-            if ((now - last_tog) >= half_ms) {
-                led1 = led2 = (led1 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
-                buz         = GPIO_PIN_RESET;
-                last_tog    = now;
-            }
-        }
-        break;
-
-    case NAV_PIVOT_LEFT:
-        /* Left turn indicator: LED1 rapid blink (≈5 Hz) */
-        if ((now - last_tog) >= 100U) {
-            led1 = (led1 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
-            led2 = GPIO_PIN_RESET;
-            buz  = GPIO_PIN_RESET;
-            last_tog = now;
-        }
-        break;
-
-    case NAV_PIVOT_RIGHT:
-        /* Right turn indicator: LED2 rapid blink (≈5 Hz) */
-        if ((now - last_tog) >= 100U) {
-            led2 = (led2 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
-            led1 = GPIO_PIN_RESET;
-            buz  = GPIO_PIN_RESET;
-            last_tog = now;
+        /* Moving forward: slow heartbeat on both LEDs, buzzer off */
+        if ((now - last_tog) >= 500U) {
+            led1 = led2 = (led1 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
+            buz         = GPIO_PIN_RESET;
+            last_tog    = now;
         }
         break;
 
     case NAV_BACKWARD:
-        /* Reverse: LEDs alternate fast + buzzer chirps like a truck */
-        if ((now - last_tog) >= 130U) {
-            led1     = (led1 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
-            led2     = (led1 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;  /* opposite */
-            buz      = led1;   /* buzzer pulses with LED1 */
-            last_tog = now;
+        /* Moving backward: faster blink on both LEDs, buzzer on */
+        if ((now - last_tog) >= 200U) {
+            led1 = led2 = (led1 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
+            buz         = GPIO_PIN_SET;
+            last_tog    = now;
         }
         break;
 
     case NAV_STOP:
     default:
-        /* Assessment pause: both LEDs medium blink, buzzer off */
-        if ((now - last_tog) >= 200U) {
-            led1 = led2 = (led1 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
-            buz         = GPIO_PIN_RESET;
-            last_tog    = now;
-        }
+        /* Stopped: both LEDs solid, buzzer solid */
+        led1 = led2 = buz = GPIO_PIN_SET;
         break;
     }
 
@@ -443,7 +371,7 @@ static void alert_update(NavState_t state, float us5_cm, float us6_cm, uint16_t 
 }
 
 /* =====================================================================
-   NAVIGATION STATE MACHINE
+   NAVIGATION STATE MACHINE — SIMPLIFIED for emergency braking test
    ===================================================================== */
 static void nav_set(NavState_t s)
 {
@@ -457,169 +385,59 @@ static void nav_update(float us1, float us2, float us3, float us4,
                        float us5, float us6, uint8_t ir)
 {
     /* Convert to safe values: −1 (invalid/no echo) → 999 (treat as clear) */
-    float s1 = nav_cm(us1);   /* right       */
     float s2 = nav_cm(us2);   /* front-right */
-    float s3 = nav_cm(us3);   /* left        */
     float s4 = nav_cm(us4);   /* front-left  */
     float s5 = nav_cm(us5);   /* rear-right  */
     float s6 = nav_cm(us6);   /* rear-left   */
 
     /* Pre-compute condition flags */
-    uint8_t front_r_block = (s2 < NAV_FRONT_STOP_CM);
-    uint8_t front_l_block = (s4 < NAV_FRONT_STOP_CM);
-    uint8_t front_block   = front_r_block || front_l_block;
-    uint8_t front_crit    = (s2 < NAV_CRITICAL_CM) || (s4 < NAV_CRITICAL_CM);
-    uint8_t rear_block    = (s5 < NAV_REAR_STOP_CM) || (s6 < NAV_REAR_STOP_CM);
-    uint8_t right_wall    = (s1 < NAV_SIDE_WARN_CM);
-    uint8_t left_wall     = (s3 < NAV_SIDE_WARN_CM);
-
-    /* ---- IR object: hard stop, priority over everything ---- */
-    if (ir && (g_nav != NAV_STOP)) {
-        motors_stop();
-        nav_set(NAV_STOP);
-        return;
-    }
+    uint8_t front_brake = (s2 < NAV_BRAKE_CM) || (s4 < NAV_BRAKE_CM);
+    uint8_t rear_brake  = (s5 < NAV_BRAKE_CM) || (s6 < NAV_BRAKE_CM);
 
     switch (g_nav) {
 
     /* ================================================================
-       FORWARD
+       FORWARD — drive at max speed, brake if front < 30cm or IR
        ================================================================ */
     case NAV_FORWARD:
+        if (ir || front_brake) {
+            motors_stop();
+            nav_set(NAV_BACKWARD);
+            break;
+        }
+        motors_forward(DUTY_FULL);
+        break;
 
-        /* Emergency brake */
-        if (front_crit) {
+    /* ================================================================
+       BACKWARD — reverse at max speed, brake if rear < 30cm
+       ================================================================ */
+    case NAV_BACKWARD:
+        if (rear_brake) {
             motors_stop();
             nav_set(NAV_STOP);
             break;
         }
-
-        /* Need to turn */
-        if (front_block) {
-            motors_stop();
-            /*
-             * Choose spin direction:
-             *  - Front-right closer → obstacle on right → pivot LEFT
-             *  - Front-left  closer → obstacle on left  → pivot RIGHT
-             *  - If sides also blocked, pick side with more space
-             */
-            if (front_r_block && !front_l_block) {
-                nav_set(NAV_PIVOT_LEFT);
-            } else if (front_l_block && !front_r_block) {
-                nav_set(NAV_PIVOT_RIGHT);
-            } else {
-                /* Both front blocked — use side sensors to decide */
-                nav_set((s1 > s3) ? NAV_PIVOT_RIGHT : NAV_PIVOT_LEFT);
-            }
-            break;
-        }
-
-        /* Gentle wall-following steer (side sensors) */
-        if (right_wall && !left_wall) {
-            motors_steer_left();    /* right wall → drift left */
-        } else if (left_wall && !right_wall) {
-            motors_steer_right();   /* left wall  → drift right */
-        } else {
-            /* Open road — speed proportional to nearest front distance */
-            float front_min = (s2 < s4) ? s2 : s4;
-            uint32_t duty   = DUTY_FULL;
-            if (front_min < NAV_FRONT_WARN_CM) {
-                float ratio = (front_min - NAV_FRONT_STOP_CM) /
-                              (NAV_FRONT_WARN_CM - NAV_FRONT_STOP_CM);
-                if (ratio < 0.0f) ratio = 0.0f;
-                if (ratio > 1.0f) ratio = 1.0f;
-                duty = (uint32_t)(DUTY_SLOW + ratio * (float)(DUTY_FULL - DUTY_SLOW));
-            }
-            motors_forward(duty);
-        }
+        motors_backward(DUTY_FULL);
         break;
 
     /* ================================================================
-       PIVOT LEFT
-       ================================================================ */
-    case NAV_PIVOT_LEFT:
-        motors_pivot_left();
-
-        if (nav_elapsed() >= PIVOT_MAX_MS) {
-            /* Spinning too long, go back instead */
-            nav_set(NAV_BACKWARD);
-            break;
-        }
-        /* Once front clear (and minimum time elapsed) → go forward */
-        if (!front_block && (nav_elapsed() >= PIVOT_MIN_MS)) {
-            nav_set(NAV_FORWARD);
-        }
-        break;
-
-    /* ================================================================
-       PIVOT RIGHT
-       ================================================================ */
-    case NAV_PIVOT_RIGHT:
-        motors_pivot_right();
-
-        if (nav_elapsed() >= PIVOT_MAX_MS) {
-            nav_set(NAV_BACKWARD);
-            break;
-        }
-        if (!front_block && (nav_elapsed() >= PIVOT_MIN_MS)) {
-            nav_set(NAV_FORWARD);
-        }
-        break;
-
-    /* ================================================================
-       BACKWARD
-       ================================================================ */
-    case NAV_BACKWARD:
-        /* Rear sensors: instant stop if something behind */
-        if (rear_block) {
-            motors_stop();
-            /*
-             * Rear blocked — choose spin away from the blocked rear sensor
-             * US5 = rear-right, US6 = rear-left
-             */
-            nav_set((s5 < s6) ? NAV_PIVOT_LEFT : NAV_PIVOT_RIGHT);
-            break;
-        }
-
-        motors_backward(DUTY_SLOW);
-
-        if (nav_elapsed() >= BACKUP_MS) {
-            /* Done reversing — choose spin based on side space */
-            nav_set((s1 > s3) ? NAV_PIVOT_RIGHT : NAV_PIVOT_LEFT);
-        }
-        break;
-
-    /* ================================================================
-       STOP (assessment / IR triggered)
+       STOP — do nothing
        ================================================================ */
     case NAV_STOP:
     default:
         motors_stop();
-
-        if (nav_elapsed() >= STOP_ASSESS_MS) {
-            if (!ir) {
-                /* IR cleared — choose best move */
-                if (!front_block) {
-                    nav_set(NAV_FORWARD);
-                } else {
-                    nav_set((s1 > s3) ? NAV_PIVOT_RIGHT : NAV_PIVOT_LEFT);
-                }
-            }
-            /* else stay stopped while IR sees object */
-        }
         break;
     }
 }
 
 /* =====================================================================
-   GAP DELAY — maintain alerts + servo during inter-sensor gaps
+   GAP DELAY — maintain alerts during inter-sensor gaps
    ===================================================================== */
 static void gap_delay(uint32_t ms)
 {
     uint32_t end = HAL_GetTick() + ms;
     while (HAL_GetTick() < end) {
-        alert_update(g_nav, g_us5, g_us6, g_ir);
-        servo_sweep_update();
+        alert_update(g_nav);
         HAL_Delay(5U);
     }
 }
@@ -642,18 +460,17 @@ int main(void)
     DWT_Init();
     DWT->CYCCNT = 0U;
 
-    /* Servo setup */
+    /* Servo setup — centered and still */
     servo_config_50hz();
     (void)HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
-    servo_set_us(SERVO_CENTER_US);
+    servo_set_us(SERVO_CENTER_US);  /* Keep servo centered, don't sweep */
 
     /* Motor PWM timers */
     (void)HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
     (void)HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
 
-    /* Start stopped — let bot assess surroundings first */
-    motors_stop();
-    nav_set(NAV_STOP);
+    /* Start moving forward immediately for the braking test */
+    nav_set(NAV_FORWARD);
 
     printf("BOOT: obstacle-avoiding car\r\n");
 
@@ -690,31 +507,22 @@ int main(void)
         nav_update(us1, us2, us3, us4, us5, us6, ir_flag);
 
         /* ---------- Alerts ---------- */
-        alert_update(g_nav, us5, us6, g_ir);
-
-        /* ---------- Servo ---------- */
-        servo_sweep_update();
+        alert_update(g_nav);
 
         /* ---------- Debug UART (every 500 ms) ---------- */
         {
             static uint32_t last_p = 0U;
             uint32_t now = HAL_GetTick();
             if ((now - last_p) >= 500U) {
-                static const char *st[] = {"FWD","PIL","PIR","BCK","STP"};
+                static const char *st[] = {"FWD","BCK","STP"};
                 /* Use integer arithmetic to avoid %f linker dependency */
-                int i1 = (us1 < 0.0f) ? -1 : (int)(us1 * 10.0f);
                 int i2 = (us2 < 0.0f) ? -1 : (int)(us2 * 10.0f);
-                int i3 = (us3 < 0.0f) ? -1 : (int)(us3 * 10.0f);
                 int i4 = (us4 < 0.0f) ? -1 : (int)(us4 * 10.0f);
                 int i5 = (us5 < 0.0f) ? -1 : (int)(us5 * 10.0f);
                 int i6 = (us6 < 0.0f) ? -1 : (int)(us6 * 10.0f);
-                printf("ST=%s IR=%u "
-                       "U1=%d.%d U2=%d.%d U3=%d.%d "
-                       "U4=%d.%d U5=%d.%d U6=%d.%d\r\n",
+                printf("STATE=%s IR=%u FRONT_R=%d.%d FRONT_L=%d.%d REAR_R=%d.%d REAR_L=%d.%d\r\n",
                        st[g_nav], (unsigned int)g_ir,
-                       i1/10, (i1<0)?0:(i1%10),
                        i2/10, (i2<0)?0:(i2%10),
-                       i3/10, (i3<0)?0:(i3%10),
                        i4/10, (i4<0)?0:(i4%10),
                        i5/10, (i5<0)?0:(i5%10),
                        i6/10, (i6<0)?0:(i6%10));
