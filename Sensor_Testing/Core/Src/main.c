@@ -92,18 +92,18 @@ extern void     asm_tim_set_ccr(uint32_t tim_base, uint32_t ccr_off,
 #define DUTY_SLOW    320U
 
 /* Navigation thresholds (cm) */
-#define NAV_CRITICAL_CM      5.0f   /* immediate emergency pivot            */
-#define NAV_FRONT_STOP_CM   20.0f   /* must turn                            */
-#define NAV_FRONT_WARN_CM   35.0f   /* slow down / servo freeze             */
-#define NAV_SIDE_WARN_CM    12.0f   /* gentle wall steer                    */
-#define NAV_REAR_STOP_CM    15.0f   /* abort reverse                        */
+#define NAV_CRITICAL_CM      8.0f   /* immediate emergency pivot            */
+#define NAV_FRONT_STOP_CM   30.0f   /* must turn                            */
+#define NAV_FRONT_WARN_CM   45.0f   /* slow down / servo freeze             */
+#define NAV_SIDE_WARN_CM    15.0f   /* gentle wall steer                    */
+#define NAV_REAR_STOP_CM    20.0f   /* abort reverse                        */
 
 /* Navigation timing (ms) — tune these four to match your robot's speed */
-#define PIVOT_90_MS         700U    /* ~90°  in-place pivot                 */
-#define PIVOT_180_MS       1400U    /* ~180° U-turn pivot                   */
-#define PIVOT_DODGE_MS      380U    /* short IR-dodge pivot                 */
-#define PIVOT_MIN_MS        220U    /* earliest permissible early exit      */
-#define BACKUP_MS           550U    /* reverse duration before big pivot    */
+#define PIVOT_90_MS        1100U    /* ~90°  in-place pivot                 */
+#define PIVOT_180_MS       2200U    /* ~180° U-turn pivot                   */
+#define PIVOT_DODGE_MS      500U    /* short IR-dodge pivot                 */
+#define PIVOT_MIN_MS        350U    /* earliest permissible early exit      */
+#define BACKUP_MS           900U    /* reverse duration before big pivot    */
 
 /* Ultrasonic sensor port/pin groups ---------------------------------- */
 #define US1_TRIG_PORT  GPIOC
@@ -167,6 +167,7 @@ static NavState_t g_nav           = NAV_FORWARD;
 static uint32_t   g_nav_start     = 0U;
 static uint32_t   g_pivot_ms      = PIVOT_90_MS; /* target pivot duration  */
 static uint8_t    g_post_rev_dir  = 0U;           /* 0=L 1=R after reverse  */
+static uint32_t   g_slow_until    = 0U;           /* keep slow until this time */
 
 /* Shared with gap_delay for real-time alerts */
 static volatile float    g_us5 = -1.0f;
@@ -597,6 +598,9 @@ static void nav_update(float us1, float us2, float us3, float us4,
                 duty = (uint32_t)(DUTY_SLOW +
                        ratio * (float)(DUTY_FULL - DUTY_SLOW));
             }
+            if (HAL_GetTick() < g_slow_until) {
+                if (duty > DUTY_SLOW) duty = DUTY_SLOW;
+            }
             motors_forward(duty);
         }
         break;
@@ -611,11 +615,13 @@ static void nav_update(float us1, float us2, float us3, float us4,
 
         if (nav_elapsed() >= g_pivot_ms) {
             /* Time's up — move forward regardless (bot keeps going) */
+            g_slow_until = HAL_GetTick() + 1500U;
             nav_set(NAV_FORWARD);
             break;
         }
         if (!front_blk && (nav_elapsed() >= PIVOT_MIN_MS)) {
             /* Front cleared early → go! */
+            g_slow_until = HAL_GetTick() + 1500U;
             nav_set(NAV_FORWARD);
         }
         break;
@@ -627,10 +633,12 @@ static void nav_update(float us1, float us2, float us3, float us4,
         motors_pivot_right();
 
         if (nav_elapsed() >= g_pivot_ms) {
+            g_slow_until = HAL_GetTick() + 1500U;
             nav_set(NAV_FORWARD);
             break;
         }
         if (!front_blk && (nav_elapsed() >= PIVOT_MIN_MS)) {
+            g_slow_until = HAL_GetTick() + 1500U;
             nav_set(NAV_FORWARD);
         }
         break;
