@@ -25,32 +25,38 @@ tr:hover td { background: var(--color-background-secondary); }
 </thead>
 <tbody>
 
+<!-- (Right) -->
 <tr class="section"><td colspan="4">Ultrasonic sensor 1 (US1)</td></tr>
 <tr><td>Ultrasonic 1</td><td>TRIG</td><td>PC0</td><td><span class="badge out">Output PP</span></td></tr>
 <tr><td>Ultrasonic 1</td><td>ECHO</td><td>PA4</td><td><span class="badge in">EXTI rising, pull-down</span></td></tr>
 
+<!-- (Front Right) -->
 <tr class="section"><td colspan="4">Ultrasonic sensor 2 (US2)</td></tr>
 <tr><td>Ultrasonic 2</td><td>TRIG</td><td>PC1</td><td><span class="badge out">Output PP</span></td></tr>
 <tr><td>Ultrasonic 2</td><td>ECHO</td><td>PC2</td><td><span class="badge in">EXTI rising, pull-down</span></td></tr>
 
+<!-- (Left) -->
 <tr class="section"><td colspan="4">Ultrasonic sensor 3 (US3)</td></tr>
 <tr><td>Ultrasonic 3</td><td>TRIG</td><td>PC3</td><td><span class="badge out">Output PP</span></td></tr>
 <tr><td>Ultrasonic 3</td><td>ECHO</td><td>PC6</td><td><span class="badge in">EXTI rising, pull-down</span></td></tr>
 
-<tr class="section"><td colspan="4">Ultrasonic sensor 4 (US4)</td></tr>
+<!-- (Front left) -->
+<tr class="section"><td colspan="4">Ultrasonic sensor 4 (US4)</td></tr> 
 <tr><td>Ultrasonic 4</td><td>TRIG</td><td>PC5</td><td><span class="badge out">Output PP</span></td></tr>
 <tr><td>Ultrasonic 4</td><td>ECHO</td><td>PA5</td><td><span class="badge in">EXTI rising, pull-down</span></td></tr>
 
+<!-- (Rear Right) -->
 <tr class="section"><td colspan="4">Ultrasonic sensor 5 (US5)</td></tr>
 <tr><td>Ultrasonic 5</td><td>TRIG</td><td>PB0</td><td><span class="badge out">Output PP</span></td></tr>
 <tr><td>Ultrasonic 5</td><td>ECHO</td><td>PB1</td><td><span class="badge in">EXTI rising, pull-down</span></td></tr>
 
+<!-- (Rear Left) -->
 <tr class="section"><td colspan="4">Ultrasonic sensor 6 (US6)</td></tr>
 <tr><td>Ultrasonic 6</td><td>TRIG</td><td>PB10</td><td><span class="badge out">Output PP</span></td></tr>
 <tr><td>Ultrasonic 6</td><td>ECHO</td><td>PB11</td><td><span class="badge in">EXTI rising, pull-down</span></td></tr>
 
 <tr class="section"><td colspan="4">IR sensor</td></tr>
-<tr><td>IR sensor</td><td>OUT</td><td>PA1 (ADC1_IN1)</td><td><span class="badge adc">Analog in (ADC)</span></td></tr>
+<tr><td>IR sensor</td><td>OUT</td><td>PC4 (ADC1_IN1)</td><td><span class="badge adc">Analog in (ADC)</span></td></tr>
 
 <tr class="section"><td colspan="4">IMU — MPU6050</td></tr>
 <tr><td>MPU6050</td><td>SCL</td><td>TBD</td><td><span class="badge i2c">I2C1 SCL</span></td></tr>
@@ -72,8 +78,8 @@ tr:hover td { background: var(--color-background-secondary); }
 
 <tr class="section"><td colspan="4">Buzzer &amp; LEDs</td></tr>
 <tr><td>Buzzer</td><td>+</td><td>PB8</td><td><span class="badge out">Output PP</span></td></tr>
-<tr><td>Alert LED 1 (US5)</td><td>+</td><td>PB12</td><td><span class="badge out">Output PP</span></td></tr>
-<tr><td>Alert LED 2 (US6)</td><td>+</td><td>PA13</td><td><span class="badge out">Output PP</span></td></tr>
+<tr><td>Alert LED 1 (US5)</td><td>+</td><td>PB9</td><td><span class="badge out">Output PP</span></td></tr>
+<tr><td>Alert LED 2 (US6)</td><td>+</td><td>PB12</td><td><span class="badge out">Output PP</span></td></tr>
 
 <tr class="section"><td colspan="4">UART debug</td></tr>
 <tr><td>USART2 (debug/printf)</td><td>TX</td><td>PA2</td><td><span class="badge i2c">AF PP (USART2)</span></td></tr>
