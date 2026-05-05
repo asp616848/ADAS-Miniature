@@ -1,32 +1,35 @@
 /* USER CODE BEGIN Header */
 /**
   ******************************************************************************
-  * @file           : main.c
-  * @brief          : Intelligent obstacle-avoiding car — STM32F103
+  * @file    main.c
+  * @brief   ADAS Miniature — always-moving obstacle avoidance, STM32F103RB
   *
-  * Sensor layout (bird's-eye):
-  *   US3(L) ←  [BOT]  → US1(R)
-  *   US4(FL)↗         ↖US2(FR)
-  *              [FWD]
-  *   US6(RL)↙         ↘US5(RR)
+  * Sensor layout (bird's-eye, FWD = up):
   *
-  * Navigation logic:
-  *   • Default: drive FORWARD, speed ∝ front clearance
-  *   • Front blocked → PIVOT away from obstruction
-  *   • Pivot timeout → BACKWARD
-  *   • Reversing → check US5/US6, stop if rear hit
-  *   • IR object → full STOP, blare buzzer
-  *   • Side walls → gentle steering before hard turn
+  *          US3(L) ←─── [BOT] ───→ US1(R)
+  *          US4(FL)↗               ↖US2(FR)
+  *                      [FWD ↑]
+  *          US6(RL)↙               ↘US5(RR)
   *
-  * LED / Buzzer:
-  *   • FWD clear  : slow heartbeat (1 Hz)
-  *   • FWD warn   : faster blink, proximity-proportional buzzer
-  *   • PIVOT LEFT : LED1 rapid blink (5 Hz turn signal)
-  *   • PIVOT RIGHT: LED2 rapid blink (5 Hz turn signal)
-  *   • BACKWARD   : LEDs alternate + buzzer chirp (reversing beep)
-  *   • STOP/IR    : both LEDs solid + buzzer solid
+  * Motor 1 = RIGHT wheel  (TIM3_CH1/PA6 speed, PB14/IN1, PB15/IN2)
+  * Motor 2 = LEFT  wheel  (PB13/ENB on-off,    PC7/IN3,  PC8/IN4 )
   *
-  * Servo: continuous left↔right sweep (no lock-out).
+  * Key constraints
+  *   • Robot NEVER fully stops — always in motion or turning.
+  *   • Robot NEVER collides   — multi-layer threshold logic.
+  *
+  * Manoeuvre vocabulary
+  *   PIVOT_LEFT  : right-fwd  + left-back  (CCW spin, turns vehicle left)
+  *   PIVOT_RIGHT : right-back + left-fwd   (CW  spin, turns vehicle right)
+  *   REVERSE     : both wheels back; transitions to a big pivot (U-turn)
+  *   FORWARD     : variable speed; gentle steering near side walls
+  *
+  * Servo  : sweeps freely when open; freezes toward obstacle / turn dir.
+  * Alerts : LED1/LED2/buzzer encode current state non-blocking.
+  *
+  * Assembly drivers (sensor_asm.s):
+  *   asm_dwt_init, asm_delay_us, asm_ultrasonic_ticks, asm_adc1_read,
+  *   asm_gpio_set, asm_gpio_reset, asm_tim_set_ccr
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -36,63 +39,73 @@
 #include <string.h>
 
 /* =====================================================================
-   DEFINES
+   ASSEMBLY FUNCTION DECLARATIONS
    ===================================================================== */
-#define ADC_TIMEOUT_MS        10U
-#define US_MIN_CM             2.0f
-#define US_MAX_CM           300.0f
-#define US_GAP_MS             25U      /* inter-sensor crosstalk guard */
-#define IR_ALERT_TH         1000U      /* ADC counts below this = object */
+extern void     asm_dwt_init(void);
+extern void     asm_delay_us(uint32_t us);
+extern uint32_t asm_ultrasonic_ticks(GPIO_TypeDef *tp, uint16_t t_pin,
+                                      GPIO_TypeDef *ep, uint16_t e_pin);
+extern uint16_t asm_adc1_read(void);
+extern void     asm_gpio_set  (uint32_t port_base, uint32_t pin_mask);
+extern void     asm_gpio_reset(uint32_t port_base, uint32_t pin_mask);
+extern void     asm_tim_set_ccr(uint32_t tim_base, uint32_t ccr_off,
+                                 uint32_t val);
 
-/* Servo (TIM1_CH4) --------------------------------------------------- */
-#define SERVO_LEFT_US        1000U
-#define SERVO_CENTER_US      1500U
-#define SERVO_RIGHT_US       2000U
-#define SERVO_HALF_SWEEP_MS  2500U    /* left→right in 2.5 s, same back */
+/* =====================================================================
+   DEFINES — sensor ranges
+   ===================================================================== */
+#define US_MIN_CM            2.0f
+#define US_MAX_CM          300.0f
+#define US_GAP_MS           25U      /* inter-sensor crosstalk guard        */
+#define ADC_TIMEOUT_MS      10U
+#define IR_ALERT_TH       1000U      /* ADC counts below this → object near */
 
-/* Motor 1 (left wheel): ENA→PA6(TIM3_CH1 PWM speed),
-                          IN1→PB14, IN2→PB15 (direction GPIOs)
-   Motor 2 (right wheel): ENB→PB13 (GPIO on/off, no PWM),
-                           IN3→PC7,  IN4→PC8 (direction GPIOs)       */
-#define M1_ENA_PORT          GPIOA
-#define M1_ENA_PIN           GPIO_PIN_6    /* TIM3_CH1 AF drives speed */
-#define M1_IN1_PORT          GPIOB
-#define M1_IN1_PIN           GPIO_PIN_14
-#define M1_IN2_PORT          GPIOB
-#define M1_IN2_PIN           GPIO_PIN_15
-#define M1_PWM_PERIOD        999U
+/* Servo (TIM1 CH4) --------------------------------------------------- */
+#define SERVO_LEFT_US      1000U
+#define SERVO_CENTER_US    1500U
+#define SERVO_RIGHT_US     2000U
+#define SERVO_HALF_MS      2500U     /* half-sweep period (left→right 2.5 s)*/
 
-#define M2_ENB_PORT          GPIOB
-#define M2_ENB_PIN           GPIO_PIN_13
-#define M2_IN3_PORT          GPIOC
-#define M2_IN3_PIN           GPIO_PIN_7
-#define M2_IN4_PORT          GPIOC
-#define M2_IN4_PIN           GPIO_PIN_8
+/* TIM CCR register offsets ------------------------------------------- */
+#define TIM_CCR1_OFF        0x34U
+#define TIM_CCR2_OFF        0x38U
+#define TIM_CCR4_OFF        0x40U
 
-/* Forward polarity — swap if wheels spin wrong way */
-#define M1_FWD_IN1           GPIO_PIN_SET
-#define M1_FWD_IN2           GPIO_PIN_RESET
-#define M2_FWD_IN3           GPIO_PIN_RESET
-#define M2_FWD_IN4           GPIO_PIN_SET
+/* Motor pin masks / port addresses ----------------------------------- */
+/* Motor 1 (RIGHT) */
+#define M1_IN1_BASE  ((uint32_t)GPIOB)
+#define M1_IN1_PIN   GPIO_PIN_14
+#define M1_IN2_BASE  ((uint32_t)GPIOB)
+#define M1_IN2_PIN   GPIO_PIN_15
 
-/* Motor duty (0 – M1_PWM_PERIOD = 0 – 999) */
-#define DUTY_FULL            900U
-#define DUTY_SLOW            350U
+/* Motor 2 (LEFT) */
+#define M2_ENB_BASE  ((uint32_t)GPIOB)
+#define M2_ENB_PIN   GPIO_PIN_13
+#define M2_IN3_BASE  ((uint32_t)GPIOC)
+#define M2_IN3_PIN   GPIO_PIN_7
+#define M2_IN4_BASE  ((uint32_t)GPIOC)
+#define M2_IN4_PIN   GPIO_PIN_8
+
+/* Motor 1 duty cycle limits (0 – 999) */
+#define DUTY_FULL    900U
+#define DUTY_HALF    600U
+#define DUTY_SLOW    320U
 
 /* Navigation thresholds (cm) */
-#define NAV_CRITICAL_CM       6.0f    /* Emergency brake */
-#define NAV_FRONT_STOP_CM    25.0f    /* Trigger turn decision */
-#define NAV_FRONT_WARN_CM    40.0f    /* Start slowing */
-#define NAV_SIDE_WARN_CM     15.0f    /* Steer away from wall */
-#define NAV_REAR_STOP_CM     18.0f    /* Stop reversing */
+#define NAV_CRITICAL_CM      8.0f   /* immediate emergency pivot            */
+#define NAV_FRONT_STOP_CM   30.0f   /* must turn                            */
+#define NAV_FRONT_WARN_CM   45.0f   /* slow down / servo freeze             */
+#define NAV_SIDE_WARN_CM    15.0f   /* gentle wall steer                    */
+#define NAV_REAR_STOP_CM    20.0f   /* abort reverse                        */
 
-/* Navigation timing (ms) */
-#define PIVOT_MIN_MS         600U     /* Minimum pivot before checking clear */
-#define PIVOT_MAX_MS        1800U     /* Give up pivoting → go backward */
-#define BACKUP_MS            900U     /* Reverse duration */
-#define STOP_ASSESS_MS       350U     /* Pause before reassessing */
+/* Navigation timing (ms) — tune these four to match your robot's speed */
+#define PIVOT_90_MS        1100U    /* ~90°  in-place pivot                 */
+#define PIVOT_180_MS       2200U    /* ~180° U-turn pivot                   */
+#define PIVOT_DODGE_MS      500U    /* short IR-dodge pivot                 */
+#define PIVOT_MIN_MS        350U    /* earliest permissible early exit      */
+#define BACKUP_MS           900U    /* reverse duration before big pivot    */
 
-/* Ultrasonic pins */
+/* Ultrasonic sensor port/pin groups ---------------------------------- */
 #define US1_TRIG_PORT  GPIOC
 #define US1_TRIG_PIN   GPIO_PIN_0
 #define US1_ECHO_PORT  GPIOA
@@ -124,15 +137,15 @@
 #define US6_ECHO_PIN   GPIO_PIN_11
 
 /* Output pins */
-#define BUZZER_PORT      GPIOB
+#define BUZZER_BASE      ((uint32_t)GPIOB)
 #define BUZZER_PIN       GPIO_PIN_8
-#define ALERT_LED_PORT   GPIOB    /* LED1 – rear-right side indicator */
-#define ALERT_LED_PIN    GPIO_PIN_9
-#define ALERT_LED2_PORT  GPIOB    /* LED2 – rear-left  side indicator */
-#define ALERT_LED2_PIN   GPIO_PIN_12
+#define LED1_BASE        ((uint32_t)GPIOB)
+#define LED1_PIN         GPIO_PIN_9
+#define LED2_BASE        ((uint32_t)GPIOB)
+#define LED2_PIN         GPIO_PIN_12
 
 /* =====================================================================
-   PERIPHERAL HANDLES (generated by CubeMX)
+   HAL PERIPHERAL HANDLES
    ===================================================================== */
 ADC_HandleTypeDef   hadc1;
 I2C_HandleTypeDef   hi2c1;
@@ -145,19 +158,21 @@ UART_HandleTypeDef  huart2;
    ===================================================================== */
 typedef enum {
     NAV_FORWARD     = 0,
-    NAV_PIVOT_LEFT,     /* spin CCW: M1 back, M2 fwd */
-    NAV_PIVOT_RIGHT,    /* spin CW : M1 fwd, M2 back */
-    NAV_BACKWARD,
-    NAV_STOP,
+    NAV_PIVOT_LEFT,          /* CCW spin: right-fwd, left-back             */
+    NAV_PIVOT_RIGHT,         /* CW  spin: right-back, left-fwd             */
+    NAV_REVERSE,             /* back up then big pivot (U-turn path)       */
 } NavState_t;
 
-static NavState_t g_nav        = NAV_STOP;
-static uint32_t   g_nav_start  = 0U;
+static NavState_t g_nav           = NAV_FORWARD;
+static uint32_t   g_nav_start     = 0U;
+static uint32_t   g_pivot_ms      = PIVOT_90_MS; /* target pivot duration  */
+static uint8_t    g_post_rev_dir  = 0U;           /* 0=L 1=R after reverse  */
+static uint32_t   g_slow_until    = 0U;           /* keep slow until this time */
 
-/* Latest rear readings — updated during main loop, used by gap delay */
-static volatile float    g_us5  = -1.0f;
-static volatile float    g_us6  = -1.0f;
-static volatile uint16_t g_ir   = 0xFFFFU;
+/* Shared with gap_delay for real-time alerts */
+static volatile float    g_us5 = -1.0f;
+static volatile float    g_us6 = -1.0f;
+static volatile uint16_t g_ir  = 0xFFFFU;
 
 /* =====================================================================
    PRIVATE FUNCTION PROTOTYPES
@@ -181,62 +196,105 @@ int _write(int file, char *ptr, int len)
 }
 
 /* =====================================================================
-   DWT MICROSECOND DELAY
+   SENSOR WRAPPERS  (thin C shims over assembly)
    ===================================================================== */
-static void DWT_Init(void)
-{
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->CTRL        |= DWT_CTRL_CYCCNTENA_Msk;
-}
 
-static void delay_us(uint32_t us)
-{
-    uint32_t start = DWT->CYCCNT;
-    uint32_t ticks = us * (SystemCoreClock / 1000000U);
-    while ((DWT->CYCCNT - start) < ticks);
-}
-
-/* =====================================================================
-   ULTRASONIC READ  (returns cm, −1 on timeout / out of range)
-   ===================================================================== */
+/* Convert echo pulse (in DWT cycles at 8 MHz) to cm */
 static float ultrasonic_read(GPIO_TypeDef *tp, uint16_t t_pin,
                               GPIO_TypeDef *ep, uint16_t e_pin)
 {
-    uint32_t to = 30000U;
-    HAL_GPIO_WritePin(tp, t_pin, GPIO_PIN_RESET); delay_us(2U);
-    HAL_GPIO_WritePin(tp, t_pin, GPIO_PIN_SET);   delay_us(10U);
-    HAL_GPIO_WritePin(tp, t_pin, GPIO_PIN_RESET);
-
-    while (HAL_GPIO_ReadPin(ep, e_pin) == GPIO_PIN_RESET)
-        if (--to == 0U) return -1.0f;
-
-    uint32_t t0 = DWT->CYCCNT;
-
-    while (HAL_GPIO_ReadPin(ep, e_pin) == GPIO_PIN_SET)
-        if (--to == 0U) return -1.0f;
-
-    float dt_us = (float)(DWT->CYCCNT - t0) / (float)(SystemCoreClock / 1000000U);
+    uint32_t ticks = asm_ultrasonic_ticks(tp, t_pin, ep, e_pin);
+    if (ticks == 0U) return -1.0f;
+    /* At 8 MHz: 1 cycle = 0.125 µs; distance = (cycles/8 µs) × 0.0343/2 cm */
+    float dt_us = (float)ticks / 8.0f;          /* µs                       */
     float cm    = (dt_us * 0.0343f) / 2.0f;
     return ((cm < US_MIN_CM) || (cm > US_MAX_CM)) ? -1.0f : cm;
 }
 
-/* =====================================================================
-   IR READ  (12-bit ADC)
-   ===================================================================== */
+/* ADC read: returns raw 12-bit count or 0xFFFF on error */
 static uint16_t read_ir(void)
 {
-    if (HAL_ADC_Start(&hadc1) != HAL_OK) return 0xFFFFU;
-    if (HAL_ADC_PollForConversion(&hadc1, ADC_TIMEOUT_MS) != HAL_OK) return 0xFFFFU;
-    return (uint16_t)HAL_ADC_GetValue(&hadc1);
+    return asm_adc1_read();
 }
 
 /* =====================================================================
-   HELPER: treat invalid (−1) as "very far" for navigation decisions
+   NAVIGATION HELPER
    ===================================================================== */
+/* Treat invalid readings as "very far" so they don't falsely block nav */
 static float nav_cm(float raw) { return (raw < US_MIN_CM) ? 999.0f : raw; }
 
+static void nav_set(NavState_t s)
+{
+    g_nav       = s;
+    g_nav_start = HAL_GetTick();
+}
+
+static uint32_t nav_elapsed(void) { return HAL_GetTick() - g_nav_start; }
+
 /* =====================================================================
-   SERVO — CONTINUOUS PING-PONG SWEEP (no lock-out)
+   MOTOR PRIMITIVES  (use assembly GPIO / timer writes)
+   ===================================================================== */
+
+/* Motor 1 (RIGHT) — speed via TIM3 CCR1 on PA6 */
+static void m1_set_duty(uint32_t d)
+{
+    if (d > 999U) d = 999U;
+    asm_tim_set_ccr((uint32_t)TIM3, TIM_CCR1_OFF, d);
+    asm_tim_set_ccr((uint32_t)TIM3, TIM_CCR2_OFF, 0U); /* PA7 keep silent */
+}
+
+static void m1_forward(uint32_t duty)
+{
+    asm_gpio_set  (M1_IN1_BASE, M1_IN1_PIN);   /* IN1 high                  */
+    asm_gpio_reset(M1_IN2_BASE, M1_IN2_PIN);   /* IN2 low                   */
+    m1_set_duty(duty);
+}
+
+static void m1_backward(uint32_t duty)
+{
+    asm_gpio_reset(M1_IN1_BASE, M1_IN1_PIN);   /* IN1 low                   */
+    asm_gpio_set  (M1_IN2_BASE, M1_IN2_PIN);   /* IN2 high                  */
+    m1_set_duty(duty);
+}
+
+static void m1_stop(void) { m1_set_duty(0U); }
+
+/* Motor 2 (LEFT) — GPIO on/off only (no PWM) */
+static void m2_forward(void)
+{
+    asm_gpio_reset(M2_IN3_BASE, M2_IN3_PIN);   /* IN3 low                   */
+    asm_gpio_set  (M2_IN4_BASE, M2_IN4_PIN);   /* IN4 high                  */
+    asm_gpio_set  (M2_ENB_BASE, M2_ENB_PIN);   /* ENB on                    */
+}
+
+static void m2_backward(void)
+{
+    asm_gpio_set  (M2_IN3_BASE, M2_IN3_PIN);   /* IN3 high                  */
+    asm_gpio_reset(M2_IN4_BASE, M2_IN4_PIN);   /* IN4 low                   */
+    asm_gpio_set  (M2_ENB_BASE, M2_ENB_PIN);   /* ENB on                    */
+}
+
+static void m2_stop(void)
+{
+    asm_gpio_reset(M2_ENB_BASE, M2_ENB_PIN);   /* ENB off → coasts          */
+}
+
+/* ---- Composite commands -------------------------------------------- */
+static void motors_forward (uint32_t d){ m1_forward(d);         m2_forward();  }
+static void motors_backward(uint32_t d){ m1_backward(d);        m2_backward(); }
+static void motors_stop    (void)       { m1_stop();             m2_stop();     }
+
+/* PIVOT LEFT  (CCW): right-fwd + left-back */
+static void motors_pivot_left (void) { m1_forward (DUTY_FULL); m2_backward(); }
+/* PIVOT RIGHT (CW):  right-back + left-fwd */
+static void motors_pivot_right(void) { m1_backward(DUTY_FULL); m2_forward();  }
+
+/* Gentle steer (one wheel slows, other full) */
+static void motors_steer_left (void) { m1_forward(DUTY_SLOW);  m2_forward();  }
+static void motors_steer_right(void) { m1_forward(DUTY_FULL);  m2_stop();     }
+
+/* =====================================================================
+   SERVO — context-aware position / sweep
    ===================================================================== */
 static void servo_config_50hz(void)
 {
@@ -257,96 +315,104 @@ static void servo_set_us(uint16_t us)
 {
     if (us < SERVO_LEFT_US)  us = SERVO_LEFT_US;
     if (us > SERVO_RIGHT_US) us = SERVO_RIGHT_US;
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, us);
+    asm_tim_set_ccr((uint32_t)TIM1, TIM_CCR4_OFF, (uint32_t)us);
 }
 
-/* Call each loop tick — smooth sweep based on HAL_GetTick() modulo */
-static void servo_sweep_update(void)
+/* Full-range ping-pong sweep, period = 2 × SERVO_HALF_MS */
+static void servo_do_sweep(void)
 {
-    uint32_t period = (uint32_t)SERVO_HALF_SWEEP_MS * 2U;
+    uint32_t period = (uint32_t)SERVO_HALF_MS * 2U;
     uint32_t phase  = HAL_GetTick() % period;
     uint16_t us;
-    if (phase < (uint32_t)SERVO_HALF_SWEEP_MS) {
-        float t = (float)phase / (float)SERVO_HALF_SWEEP_MS;
-        us = (uint16_t)((float)SERVO_LEFT_US + t * (float)(SERVO_RIGHT_US - SERVO_LEFT_US));
+    if (phase < (uint32_t)SERVO_HALF_MS) {
+        float t = (float)phase / (float)SERVO_HALF_MS;
+        us = (uint16_t)((float)SERVO_LEFT_US +
+                         t * (float)(SERVO_RIGHT_US - SERVO_LEFT_US));
     } else {
-        float t = (float)(phase - (uint32_t)SERVO_HALF_SWEEP_MS) / (float)SERVO_HALF_SWEEP_MS;
-        us = (uint16_t)((float)SERVO_RIGHT_US - t * (float)(SERVO_RIGHT_US - SERVO_LEFT_US));
+        float t = (float)(phase - (uint32_t)SERVO_HALF_MS) /
+                  (float)SERVO_HALF_MS;
+        us = (uint16_t)((float)SERVO_RIGHT_US -
+                         t * (float)(SERVO_RIGHT_US - SERVO_LEFT_US));
     }
     servo_set_us(us);
 }
 
+/*
+ * servo_update — call every loop tick.
+ * Behaviour per state:
+ *   PIVOT_LEFT   → freeze LEFT  (servo "signals" turn direction)
+ *   PIVOT_RIGHT  → freeze RIGHT
+ *   REVERSE      → freeze CENTER (looking forward while backing)
+ *   FORWARD+warn → freeze toward closest front obstacle for 1 s, then sweep
+ *   FORWARD+free → full sweep
+ */
+static void servo_update(NavState_t nav, float s2, float s4)
+{
+    static uint32_t freeze_until = 0U;
+    static uint16_t freeze_pos   = SERVO_CENTER_US;
+    uint32_t now = HAL_GetTick();
+
+    switch (nav) {
+    case NAV_PIVOT_LEFT:
+        freeze_until = now + 120U;
+        freeze_pos   = SERVO_LEFT_US;
+        servo_set_us(SERVO_LEFT_US);
+        return;
+
+    case NAV_PIVOT_RIGHT:
+        freeze_until = now + 120U;
+        freeze_pos   = SERVO_RIGHT_US;
+        servo_set_us(SERVO_RIGHT_US);
+        return;
+
+    case NAV_REVERSE:
+        servo_set_us(SERVO_CENTER_US);
+        return;
+
+    case NAV_FORWARD:
+    default:
+        {
+            float f2 = nav_cm(s2);   /* front-right distance */
+            float f4 = nav_cm(s4);   /* front-left  distance */
+
+            if ((f2 < NAV_FRONT_WARN_CM) || (f4 < NAV_FRONT_WARN_CM)) {
+                /* Obstacle approaching — freeze servo toward the blocker  */
+                uint16_t target;
+                if ((f2 < NAV_FRONT_WARN_CM) && (f4 < NAV_FRONT_WARN_CM)) {
+                    target = SERVO_CENTER_US;    /* both sides blocked       */
+                } else if (f2 < f4) {
+                    target = SERVO_RIGHT_US;     /* right-front closer       */
+                } else {
+                    target = SERVO_LEFT_US;      /* left-front  closer       */
+                }
+                /* Refresh freeze for 1 s every call while obstacle present */
+                freeze_until = now + 1000U;
+                freeze_pos   = target;
+                servo_set_us(target);
+                return;
+            }
+
+            /* No obstacle — resume sweep if freeze expired */
+            if (now < freeze_until) {
+                servo_set_us(freeze_pos);
+            } else {
+                servo_do_sweep();
+            }
+        }
+        break;
+    }
+}
+
 /* =====================================================================
-   MOTOR PRIMITIVES
+   ALERT OUTPUTS — LED1, LED2, buzzer (non-blocking)
    ===================================================================== */
-static void m1_set_pwm(uint32_t duty)
+static void alert_update(NavState_t state, float us5_cm, float us6_cm,
+                         uint16_t ir_raw)
 {
-    if (duty > M1_PWM_PERIOD) duty = M1_PWM_PERIOD;
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, duty);
-    __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_2, 0U);
-}
-
-static void m1_forward(uint32_t duty)
-{
-    HAL_GPIO_WritePin(M1_ENA_PORT, M1_ENA_PIN, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(M1_IN1_PORT, M1_IN1_PIN, M1_FWD_IN1);
-    HAL_GPIO_WritePin(M1_IN2_PORT, M1_IN2_PIN, M1_FWD_IN2);
-    m1_set_pwm(duty);
-}
-
-static void m1_backward(uint32_t duty)
-{
-    HAL_GPIO_WritePin(M1_ENA_PORT, M1_ENA_PIN, GPIO_PIN_SET);
-    /* Invert forward polarity */
-    HAL_GPIO_WritePin(M1_IN1_PORT, M1_IN1_PIN, (M1_FWD_IN1 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET);
-    HAL_GPIO_WritePin(M1_IN2_PORT, M1_IN2_PIN, (M1_FWD_IN2 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET);
-    m1_set_pwm(duty);
-}
-
-static void m1_stop(void)
-{
-    m1_set_pwm(0U);
-    HAL_GPIO_WritePin(M1_ENA_PORT, M1_ENA_PIN, GPIO_PIN_RESET);
-}
-
-static void m2_forward(void)
-{
-    HAL_GPIO_WritePin(M2_ENB_PORT, M2_ENB_PIN, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(M2_IN3_PORT, M2_IN3_PIN, M2_FWD_IN3);
-    HAL_GPIO_WritePin(M2_IN4_PORT, M2_IN4_PIN, M2_FWD_IN4);
-}
-
-static void m2_backward(void)
-{
-    HAL_GPIO_WritePin(M2_ENB_PORT, M2_ENB_PIN, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(M2_IN3_PORT, M2_IN3_PIN, (M2_FWD_IN3 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET);
-    HAL_GPIO_WritePin(M2_IN4_PORT, M2_IN4_PIN, (M2_FWD_IN4 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET);
-}
-
-static void m2_stop(void)
-{
-    HAL_GPIO_WritePin(M2_ENB_PORT, M2_ENB_PIN, GPIO_PIN_RESET);
-}
-
-/* ---- Composite motor commands ---- */
-static void motors_stop(void)         { m1_stop();             m2_stop();     }
-static void motors_forward(uint32_t d){ m1_forward(d);         m2_forward();  }
-static void motors_backward(uint32_t d){m1_backward(d);        m2_backward(); }
-static void motors_pivot_left(void)   { m1_backward(DUTY_FULL); m2_forward(); }
-static void motors_pivot_right(void)  { m1_forward(DUTY_FULL);  m2_backward();}
-/* Gentle steer: one side slows, other full speed */
-static void motors_steer_left(void)   { m1_forward(DUTY_SLOW);  m2_forward(); }
-static void motors_steer_right(void)  { m1_forward(DUTY_FULL);  m2_stop();    }
-
-/* =====================================================================
-   LED / BUZZER — state-aware, non-blocking
-   ===================================================================== */
-static void alert_update(NavState_t state, float us5_cm, float us6_cm, uint16_t ir_raw)
-{
-    static uint32_t     last_tog   = 0U;
-    static GPIO_PinState led1      = GPIO_PIN_RESET;
-    static GPIO_PinState led2      = GPIO_PIN_RESET;
-    static GPIO_PinState buz       = GPIO_PIN_RESET;
+    static uint32_t      last_tog = 0U;
+    static uint8_t       led1     = 0U;
+    static uint8_t       led2     = 0U;
+    static uint8_t       buz      = 0U;
 
     uint32_t now    = HAL_GetTick();
     uint8_t  ir_on  = (ir_raw != 0xFFFFU) && (ir_raw < IR_ALERT_TH);
@@ -354,173 +420,174 @@ static void alert_update(NavState_t state, float us5_cm, float us6_cm, uint16_t 
     float    s6     = nav_cm(us6_cm);
     float    rear   = (s5 < s6) ? s5 : s6;
 
-    /* ---- PRIORITY 1: IR object or critical rear → solid on ---- */
+    /* Priority 1: IR object or critically close rear → solid on */
     if (ir_on || (rear < NAV_CRITICAL_CM)) {
-        led1 = led2 = buz = GPIO_PIN_SET;
-        HAL_GPIO_WritePin(BUZZER_PORT,     BUZZER_PIN,     buz);
-        HAL_GPIO_WritePin(ALERT_LED_PORT,  ALERT_LED_PIN,  led1);
-        HAL_GPIO_WritePin(ALERT_LED2_PORT, ALERT_LED2_PIN, led2);
-        return;
+        led1 = led2 = buz = 1U;
+        goto apply;
     }
-
-    uint32_t half_ms = 0U;   /* toggle half-period; 0 = no toggle this state */
 
     switch (state) {
 
     case NAV_FORWARD:
-        /* Rear proximity buzzer — louder/faster as object approaches */
         if (rear < NAV_REAR_STOP_CM) {
-            float ratio = 1.0f - ((rear - NAV_CRITICAL_CM) /
-                                  (NAV_REAR_STOP_CM - NAV_CRITICAL_CM));
-            if (ratio < 0.0f) ratio = 0.0f;
-            if (ratio > 1.0f) ratio = 1.0f;
-            half_ms = (uint32_t)(350U - ratio * 270.0f);   /* 80 – 350 ms */
-            /* Buzzer follows blink; LEDs show which rear sensor */
-            if ((now - last_tog) >= half_ms) {
-                led1 = (s5 < NAV_REAR_STOP_CM) ?
-                       ((led1 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET) : GPIO_PIN_RESET;
-                led2 = (s6 < NAV_REAR_STOP_CM) ?
-                       ((led2 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET) : GPIO_PIN_RESET;
-                buz  = (led1 == GPIO_PIN_SET) || (led2 == GPIO_PIN_SET) ?
-                       GPIO_PIN_SET : GPIO_PIN_RESET;
+            /* Rear proximity: fast blink + buzzer */
+            uint32_t half = (uint32_t)(80U + 270U *
+                            ((rear - NAV_CRITICAL_CM) /
+                             (NAV_REAR_STOP_CM - NAV_CRITICAL_CM)));
+            if ((now - last_tog) >= half) {
+                led1 = (s5 < NAV_REAR_STOP_CM) ? (uint8_t)(!led1) : 0U;
+                led2 = (s6 < NAV_REAR_STOP_CM) ? (uint8_t)(!led2) : 0U;
+                buz  = (uint8_t)(led1 | led2);
                 last_tog = now;
             }
         } else {
-            /* Slow heartbeat: both LEDs gentle pulse, buzzer off */
-            half_ms = 500U;
-            if ((now - last_tog) >= half_ms) {
-                led1 = led2 = (led1 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
-                buz         = GPIO_PIN_RESET;
+            /* Clear road: slow heartbeat, no buzzer */
+            if ((now - last_tog) >= 500U) {
+                led1 = led2 = (uint8_t)(!led1);
+                buz         = 0U;
                 last_tog    = now;
             }
         }
         break;
 
     case NAV_PIVOT_LEFT:
-        /* Left turn indicator: LED1 rapid blink (≈5 Hz) */
+        /* Left turn indicator: LED1 rapid, LED2 off */
         if ((now - last_tog) >= 100U) {
-            led1 = (led1 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
-            led2 = GPIO_PIN_RESET;
-            buz  = GPIO_PIN_RESET;
+            led1 = (uint8_t)(!led1);
+            led2 = 0U;  buz = 0U;
             last_tog = now;
         }
         break;
 
     case NAV_PIVOT_RIGHT:
-        /* Right turn indicator: LED2 rapid blink (≈5 Hz) */
+        /* Right turn indicator: LED2 rapid, LED1 off */
         if ((now - last_tog) >= 100U) {
-            led2 = (led2 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
-            led1 = GPIO_PIN_RESET;
-            buz  = GPIO_PIN_RESET;
+            led2 = (uint8_t)(!led2);
+            led1 = 0U;  buz = 0U;
             last_tog = now;
         }
         break;
 
-    case NAV_BACKWARD:
-        /* Reverse: LEDs alternate fast + buzzer chirps like a truck */
+    case NAV_REVERSE:
+        /* Reversing: LEDs alternate + buzzer chirps */
         if ((now - last_tog) >= 130U) {
-            led1     = (led1 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
-            led2     = (led1 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;  /* opposite */
-            buz      = led1;   /* buzzer pulses with LED1 */
+            led1     = (uint8_t)(!led1);
+            led2     = (uint8_t)(!led1);   /* opposite of led1              */
+            buz      = led1;
             last_tog = now;
         }
         break;
 
-    case NAV_STOP:
     default:
-        /* Assessment pause: both LEDs medium blink, buzzer off */
-        if ((now - last_tog) >= 200U) {
-            led1 = led2 = (led1 == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET;
-            buz         = GPIO_PIN_RESET;
-            last_tog    = now;
-        }
         break;
     }
 
-    HAL_GPIO_WritePin(BUZZER_PORT,     BUZZER_PIN,     buz);
-    HAL_GPIO_WritePin(ALERT_LED_PORT,  ALERT_LED_PIN,  led1);
-    HAL_GPIO_WritePin(ALERT_LED2_PORT, ALERT_LED2_PIN, led2);
+apply:
+    if (led1) asm_gpio_set(LED1_BASE, LED1_PIN);
+    else       asm_gpio_reset(LED1_BASE, LED1_PIN);
+    if (led2) asm_gpio_set(LED2_BASE, LED2_PIN);
+    else       asm_gpio_reset(LED2_BASE, LED2_PIN);
+    if (buz)  asm_gpio_set(BUZZER_BASE, BUZZER_PIN);
+    else       asm_gpio_reset(BUZZER_BASE, BUZZER_PIN);
 }
 
 /* =====================================================================
-   NAVIGATION STATE MACHINE
+   NAVIGATION STATE MACHINE  — never fully stops the robot
    ===================================================================== */
-static void nav_set(NavState_t s)
-{
-    g_nav       = s;
-    g_nav_start = HAL_GetTick();
-}
-
-static uint32_t nav_elapsed(void) { return HAL_GetTick() - g_nav_start; }
-
 static void nav_update(float us1, float us2, float us3, float us4,
                        float us5, float us6, uint8_t ir)
 {
-    /* Convert to safe values: −1 (invalid/no echo) → 999 (treat as clear) */
-    float s1 = nav_cm(us1);   /* right       */
-    float s2 = nav_cm(us2);   /* front-right */
-    float s3 = nav_cm(us3);   /* left        */
-    float s4 = nav_cm(us4);   /* front-left  */
-    float s5 = nav_cm(us5);   /* rear-right  */
-    float s6 = nav_cm(us6);   /* rear-left   */
+    /* Safe-convert: invalid echo (-1) → 999 cm (treat as clear) */
+    float s1 = nav_cm(us1);   /* RIGHT       */
+    float s2 = nav_cm(us2);   /* FRONT-RIGHT */
+    float s3 = nav_cm(us3);   /* LEFT        */
+    float s4 = nav_cm(us4);   /* FRONT-LEFT  */
+    float s5 = nav_cm(us5);   /* REAR-RIGHT  */
+    float s6 = nav_cm(us6);   /* REAR-LEFT   */
 
-    /* Pre-compute condition flags */
-    uint8_t front_r_block = (s2 < NAV_FRONT_STOP_CM);
-    uint8_t front_l_block = (s4 < NAV_FRONT_STOP_CM);
-    uint8_t front_block   = front_r_block || front_l_block;
-    uint8_t front_crit    = (s2 < NAV_CRITICAL_CM) || (s4 < NAV_CRITICAL_CM);
-    uint8_t rear_block    = (s5 < NAV_REAR_STOP_CM) || (s6 < NAV_REAR_STOP_CM);
-    uint8_t right_wall    = (s1 < NAV_SIDE_WARN_CM);
-    uint8_t left_wall     = (s3 < NAV_SIDE_WARN_CM);
-
-    /* ---- IR object: hard stop, priority over everything ---- */
-    if (ir && (g_nav != NAV_STOP)) {
-        motors_stop();
-        nav_set(NAV_STOP);
-        return;
-    }
+    uint8_t front_r_blk = (s2 < NAV_FRONT_STOP_CM);
+    uint8_t front_l_blk = (s4 < NAV_FRONT_STOP_CM);
+    uint8_t front_blk   = front_r_blk | front_l_blk;
+    uint8_t front_crit  = (s2 < NAV_CRITICAL_CM) | (s4 < NAV_CRITICAL_CM);
+    uint8_t rear_blk    = (s5 < NAV_REAR_STOP_CM) | (s6 < NAV_REAR_STOP_CM);
+    uint8_t right_wall  = (s1 < NAV_SIDE_WARN_CM);
+    uint8_t left_wall   = (s3 < NAV_SIDE_WARN_CM);
 
     switch (g_nav) {
 
     /* ================================================================
-       FORWARD
+       FORWARD — primary running state
        ================================================================ */
     case NAV_FORWARD:
 
-        /* Emergency brake */
+        /* ---- Critical emergency: pivot hard away from blocked sensor ---- */
         if (front_crit) {
             motors_stop();
-            nav_set(NAV_STOP);
-            break;
-        }
-
-        /* Need to turn */
-        if (front_block) {
-            motors_stop();
-            /*
-             * Choose spin direction:
-             *  - Front-right closer → obstacle on right → pivot LEFT
-             *  - Front-left  closer → obstacle on left  → pivot RIGHT
-             *  - If sides also blocked, pick side with more space
-             */
-            if (front_r_block && !front_l_block) {
+            if (s2 < s4) {             /* right front closer → go left      */
+                g_pivot_ms = PIVOT_90_MS;
                 nav_set(NAV_PIVOT_LEFT);
-            } else if (front_l_block && !front_r_block) {
-                nav_set(NAV_PIVOT_RIGHT);
             } else {
-                /* Both front blocked — use side sensors to decide */
-                nav_set((s1 > s3) ? NAV_PIVOT_RIGHT : NAV_PIVOT_LEFT);
+                g_pivot_ms = PIVOT_90_MS;
+                nav_set(NAV_PIVOT_RIGHT);
             }
             break;
         }
 
-        /* Gentle wall-following steer (side sensors) */
+        /* ---- IR object: quick dodge toward the more open side ---------- */
+        if (ir) {
+            motors_stop();
+            g_pivot_ms = PIVOT_DODGE_MS;
+            nav_set((s1 >= s3) ? NAV_PIVOT_RIGHT : NAV_PIVOT_LEFT);
+            break;
+        }
+
+        /* ---- Front blocked: choose 90° turn or reverse for U-turn ----- */
+        if (front_blk) {
+            motors_stop();
+            if (front_r_blk && !front_l_blk) {
+                /* Only right-front blocked → 90° left turn */
+                g_pivot_ms = PIVOT_90_MS;
+                nav_set(NAV_PIVOT_LEFT);
+            } else if (front_l_blk && !front_r_blk) {
+                /* Only left-front blocked → 90° right turn */
+                g_pivot_ms = PIVOT_90_MS;
+                nav_set(NAV_PIVOT_RIGHT);
+            } else {
+                /* Both front sensors blocked */
+                float gap = s1 - s3;             /* positive = more R space */
+                if (gap >  8.0f) {
+                    /* Clearly more room on the right → 90° right           */
+                    g_pivot_ms = PIVOT_90_MS;
+                    nav_set(NAV_PIVOT_RIGHT);
+                } else if (gap < -8.0f) {
+                    /* Clearly more room on the left → 90° left             */
+                    g_pivot_ms = PIVOT_90_MS;
+                    nav_set(NAV_PIVOT_LEFT);
+                } else {
+                    /*
+                     * Symmetric box-in: reverse then execute a 180° pivot.
+                     * Pick the post-reverse pivot direction based on which
+                     * REAR sensor has more clearance.
+                     */
+                    g_post_rev_dir = (s5 >= s6) ? 1U : 0U; /* 1=R, 0=L     */
+                    nav_set(NAV_REVERSE);
+                }
+            }
+            break;
+        }
+
+        /* ---- Side-wall gentle steering --------------------------------- */
         if (right_wall && !left_wall) {
-            motors_steer_left();    /* right wall → drift left */
-        } else if (left_wall && !right_wall) {
-            motors_steer_right();   /* left wall  → drift right */
-        } else {
-            /* Open road — speed proportional to nearest front distance */
+            motors_steer_left();   /* right wall too close → drift left     */
+            break;
+        }
+        if (left_wall && !right_wall) {
+            motors_steer_right();  /* left wall too close → drift right     */
+            break;
+        }
+
+        /* ---- Open road: speed proportional to nearest front sensor ----- */
+        {
             float front_min = (s2 < s4) ? s2 : s4;
             uint32_t duty   = DUTY_FULL;
             if (front_min < NAV_FRONT_WARN_CM) {
@@ -528,55 +595,70 @@ static void nav_update(float us1, float us2, float us3, float us4,
                               (NAV_FRONT_WARN_CM - NAV_FRONT_STOP_CM);
                 if (ratio < 0.0f) ratio = 0.0f;
                 if (ratio > 1.0f) ratio = 1.0f;
-                duty = (uint32_t)(DUTY_SLOW + ratio * (float)(DUTY_FULL - DUTY_SLOW));
+                duty = (uint32_t)(DUTY_SLOW +
+                       ratio * (float)(DUTY_FULL - DUTY_SLOW));
+            }
+            if (HAL_GetTick() < g_slow_until) {
+                if (duty > DUTY_SLOW) duty = DUTY_SLOW;
             }
             motors_forward(duty);
         }
         break;
 
     /* ================================================================
-       PIVOT LEFT
+       PIVOT LEFT (CCW): right-fwd, left-back
+       Exits early if front clears after minimum time.
+       Forced exit at g_pivot_ms → go forward and reassess.
        ================================================================ */
     case NAV_PIVOT_LEFT:
         motors_pivot_left();
 
-        if (nav_elapsed() >= PIVOT_MAX_MS) {
-            /* Spinning too long, go back instead */
-            nav_set(NAV_BACKWARD);
+        if (nav_elapsed() >= g_pivot_ms) {
+            /* Time's up — move forward regardless (bot keeps going) */
+            g_slow_until = HAL_GetTick() + 1500U;
+            nav_set(NAV_FORWARD);
             break;
         }
-        /* Once front clear (and minimum time elapsed) → go forward */
-        if (!front_block && (nav_elapsed() >= PIVOT_MIN_MS)) {
+        if (!front_blk && (nav_elapsed() >= PIVOT_MIN_MS)) {
+            /* Front cleared early → go! */
+            g_slow_until = HAL_GetTick() + 1500U;
             nav_set(NAV_FORWARD);
         }
         break;
 
     /* ================================================================
-       PIVOT RIGHT
+       PIVOT RIGHT (CW): right-back, left-fwd
        ================================================================ */
     case NAV_PIVOT_RIGHT:
         motors_pivot_right();
 
-        if (nav_elapsed() >= PIVOT_MAX_MS) {
-            nav_set(NAV_BACKWARD);
+        if (nav_elapsed() >= g_pivot_ms) {
+            g_slow_until = HAL_GetTick() + 1500U;
+            nav_set(NAV_FORWARD);
             break;
         }
-        if (!front_block && (nav_elapsed() >= PIVOT_MIN_MS)) {
+        if (!front_blk && (nav_elapsed() >= PIVOT_MIN_MS)) {
+            g_slow_until = HAL_GetTick() + 1500U;
             nav_set(NAV_FORWARD);
         }
         break;
 
     /* ================================================================
-       BACKWARD
+       REVERSE — back up, then commit to a big 180° pivot (U-turn).
+       If rear gets blocked mid-reverse, abort immediately into pivot.
        ================================================================ */
-    case NAV_BACKWARD:
-        /* Rear sensors: instant stop if something behind */
-        if (rear_block) {
-            motors_stop();
+    case NAV_REVERSE:
+
+        if (rear_blk) {
             /*
-             * Rear blocked — choose spin away from the blocked rear sensor
-             * US5 = rear-right, US6 = rear-left
+             * Something appeared behind us — stop reversing and spin
+             * away from the blocked rear sensor.
+             *   US5 = rear-right, US6 = rear-left
+             * Blocked rear-right → pivot LEFT (spin away from right wall).
+             * Blocked rear-left  → pivot RIGHT.
              */
+            motors_stop();
+            g_pivot_ms = PIVOT_180_MS;
             nav_set((s5 < s6) ? NAV_PIVOT_LEFT : NAV_PIVOT_RIGHT);
             break;
         }
@@ -584,43 +666,29 @@ static void nav_update(float us1, float us2, float us3, float us4,
         motors_backward(DUTY_SLOW);
 
         if (nav_elapsed() >= BACKUP_MS) {
-            /* Done reversing — choose spin based on side space */
-            nav_set((s1 > s3) ? NAV_PIVOT_RIGHT : NAV_PIVOT_LEFT);
+            /* Backup complete — now do the U-turn (180° pivot) */
+            g_pivot_ms = PIVOT_180_MS;
+            nav_set(g_post_rev_dir ? NAV_PIVOT_RIGHT : NAV_PIVOT_LEFT);
         }
         break;
 
-    /* ================================================================
-       STOP (assessment / IR triggered)
-       ================================================================ */
-    case NAV_STOP:
     default:
-        motors_stop();
-
-        if (nav_elapsed() >= STOP_ASSESS_MS) {
-            if (!ir) {
-                /* IR cleared — choose best move */
-                if (!front_block) {
-                    nav_set(NAV_FORWARD);
-                } else {
-                    nav_set((s1 > s3) ? NAV_PIVOT_RIGHT : NAV_PIVOT_LEFT);
-                }
-            }
-            /* else stay stopped while IR sees object */
-        }
+        /* Safety net — should never reach here */
+        nav_set(NAV_FORWARD);
         break;
     }
 }
 
 /* =====================================================================
-   GAP DELAY — maintain alerts + servo during inter-sensor gaps
+   GAP DELAY — keeps alerts + servo alive during inter-sensor pauses
    ===================================================================== */
 static void gap_delay(uint32_t ms)
 {
     uint32_t end = HAL_GetTick() + ms;
     while (HAL_GetTick() < end) {
         alert_update(g_nav, g_us5, g_us6, g_ir);
-        servo_sweep_update();
-        HAL_Delay(5U);
+        servo_update(g_nav, 999.0f, 999.0f); /* use cached front vals      */
+        HAL_Delay(4U);
     }
 }
 
@@ -639,85 +707,88 @@ int main(void)
     MX_TIM3_Init();
     MX_USART2_UART_Init();
 
-    DWT_Init();
-    DWT->CYCCNT = 0U;
+    /* Assembly DWT init (replaces C DWT_Init) */
+    asm_dwt_init();
 
-    /* Servo setup */
+    /* Servo: configure 50 Hz, center position */
     servo_config_50hz();
     (void)HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
     servo_set_us(SERVO_CENTER_US);
 
-    /* Motor PWM timers */
+    /* Motor PWM timer: start CH1 and CH2 on TIM3 */
     (void)HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
     (void)HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
 
-    /* Start stopped — let bot assess surroundings first */
-    motors_stop();
-    nav_set(NAV_STOP);
+    /* Start immediately driving forward */
+    motors_forward(DUTY_SLOW);
+    nav_set(NAV_FORWARD);
 
-    printf("BOOT: obstacle-avoiding car\r\n");
+    printf("BOOT: ADAS always-moving obstacle-avoidance\r\n");
 
     while (1)
     {
-        /* ---------- Read IR ---------- */
+        /* -------- Read IR (assembly ADC) -------- */
         g_ir = read_ir();
 
-        /* ---------- Read all 6 ultrasonic sensors (gaps service alerts) ---------- */
-        float us1 = ultrasonic_read(US1_TRIG_PORT, US1_TRIG_PIN, US1_ECHO_PORT, US1_ECHO_PIN);
+        /* -------- Read all 6 ultrasonic sensors (gaps service alerts) --- */
+        float us1 = ultrasonic_read(US1_TRIG_PORT, US1_TRIG_PIN,
+                                     US1_ECHO_PORT, US1_ECHO_PIN);
         gap_delay(US_GAP_MS);
 
-        float us2 = ultrasonic_read(US2_TRIG_PORT, US2_TRIG_PIN, US2_ECHO_PORT, US2_ECHO_PIN);
+        float us2 = ultrasonic_read(US2_TRIG_PORT, US2_TRIG_PIN,
+                                     US2_ECHO_PORT, US2_ECHO_PIN);
         gap_delay(US_GAP_MS);
 
-        float us3 = ultrasonic_read(US3_TRIG_PORT, US3_TRIG_PIN, US3_ECHO_PORT, US3_ECHO_PIN);
+        float us3 = ultrasonic_read(US3_TRIG_PORT, US3_TRIG_PIN,
+                                     US3_ECHO_PORT, US3_ECHO_PIN);
         gap_delay(US_GAP_MS);
 
-        float us4 = ultrasonic_read(US4_TRIG_PORT, US4_TRIG_PIN, US4_ECHO_PORT, US4_ECHO_PIN);
+        float us4 = ultrasonic_read(US4_TRIG_PORT, US4_TRIG_PIN,
+                                     US4_ECHO_PORT, US4_ECHO_PIN);
         gap_delay(US_GAP_MS);
 
-        float us5 = ultrasonic_read(US5_TRIG_PORT, US5_TRIG_PIN, US5_ECHO_PORT, US5_ECHO_PIN);
+        float us5 = ultrasonic_read(US5_TRIG_PORT, US5_TRIG_PIN,
+                                     US5_ECHO_PORT, US5_ECHO_PIN);
         gap_delay(US_GAP_MS);
 
-        float us6 = ultrasonic_read(US6_TRIG_PORT, US6_TRIG_PIN, US6_ECHO_PORT, US6_ECHO_PIN);
+        float us6 = ultrasonic_read(US6_TRIG_PORT, US6_TRIG_PIN,
+                                     US6_ECHO_PORT, US6_ECHO_PIN);
         gap_delay(US_GAP_MS);
 
-        /* Update globals for gap_delay usage in next iteration */
+        /* Cache rear readings for gap_delay alert use next iteration */
         g_us5 = us5;
         g_us6 = us6;
 
-        /* ---------- Navigation ---------- */
+        /* -------- Navigation decision -------- */
         uint8_t ir_flag = (uint8_t)((g_ir != 0xFFFFU) && (g_ir < IR_ALERT_TH));
         nav_update(us1, us2, us3, us4, us5, us6, ir_flag);
 
-        /* ---------- Alerts ---------- */
+        /* -------- Alerts & servo -------- */
         alert_update(g_nav, us5, us6, g_ir);
+        servo_update(g_nav, us2, us4);
 
-        /* ---------- Servo ---------- */
-        servo_sweep_update();
-
-        /* ---------- Debug UART (every 500 ms) ---------- */
+        /* -------- Debug UART (throttled to 500 ms) -------- */
         {
             static uint32_t last_p = 0U;
             uint32_t now = HAL_GetTick();
             if ((now - last_p) >= 500U) {
-                static const char *st[] = {"FWD","PIL","PIR","BCK","STP"};
-                /* Use integer arithmetic to avoid %f linker dependency */
-                int i1 = (us1 < 0.0f) ? -1 : (int)(us1 * 10.0f);
-                int i2 = (us2 < 0.0f) ? -1 : (int)(us2 * 10.0f);
-                int i3 = (us3 < 0.0f) ? -1 : (int)(us3 * 10.0f);
-                int i4 = (us4 < 0.0f) ? -1 : (int)(us4 * 10.0f);
-                int i5 = (us5 < 0.0f) ? -1 : (int)(us5 * 10.0f);
-                int i6 = (us6 < 0.0f) ? -1 : (int)(us6 * 10.0f);
+                static const char *st[] = {"FWD","PIL","PIR","REV"};
+                int i1=(us1<0.0f)?-1:(int)(us1*10.0f);
+                int i2=(us2<0.0f)?-1:(int)(us2*10.0f);
+                int i3=(us3<0.0f)?-1:(int)(us3*10.0f);
+                int i4=(us4<0.0f)?-1:(int)(us4*10.0f);
+                int i5=(us5<0.0f)?-1:(int)(us5*10.0f);
+                int i6=(us6<0.0f)?-1:(int)(us6*10.0f);
                 printf("ST=%s IR=%u "
-                       "U1=%d.%d U2=%d.%d U3=%d.%d "
-                       "U4=%d.%d U5=%d.%d U6=%d.%d\r\n",
+                       "R=%d.%d FR=%d.%d L=%d.%d "
+                       "FL=%d.%d RR=%d.%d RL=%d.%d\r\n",
                        st[g_nav], (unsigned int)g_ir,
-                       i1/10, (i1<0)?0:(i1%10),
-                       i2/10, (i2<0)?0:(i2%10),
-                       i3/10, (i3<0)?0:(i3%10),
-                       i4/10, (i4<0)?0:(i4%10),
-                       i5/10, (i5<0)?0:(i5%10),
-                       i6/10, (i6<0)?0:(i6%10));
+                       i1/10,(i1<0)?0:(i1%10),
+                       i2/10,(i2<0)?0:(i2%10),
+                       i3/10,(i3<0)?0:(i3%10),
+                       i4/10,(i4<0)?0:(i4%10),
+                       i5/10,(i5<0)?0:(i5%10),
+                       i6/10,(i6<0)?0:(i6%10));
                 last_p = now;
             }
         }
@@ -725,7 +796,7 @@ int main(void)
 }
 
 /* =====================================================================
-   SYSTEM CLOCK CONFIG  (8 MHz HSI ÷2 → PLL ×2 = 8 MHz SYSCLK)
+   SYSTEM CLOCK   (HSI/2 → PLL×2 = 8 MHz SYSCLK)
    ===================================================================== */
 void SystemClock_Config(void)
 {
@@ -777,7 +848,7 @@ static void MX_ADC1_Init(void)
 }
 
 /* =====================================================================
-   I2C1 — 100 kHz (for IMU, unused in this build)
+   I2C1 — 100 kHz (IMU reserved, unused this build)
    ===================================================================== */
 static void MX_I2C1_Init(void)
 {
@@ -794,20 +865,20 @@ static void MX_I2C1_Init(void)
 }
 
 /* =====================================================================
-   TIM1 — PWM for servo (CH4)
-   Prescaler set at runtime by servo_config_50hz() to get 1 µs/tick
+   TIM1 — 50 Hz PWM for servo (CH4 → PA11)
+   Prescaler corrected at runtime by servo_config_50hz().
    ===================================================================== */
 static void MX_TIM1_Init(void)
 {
-    TIM_ClockConfigTypeDef      scc  = {0};
-    TIM_MasterConfigTypeDef     mc   = {0};
-    TIM_OC_InitTypeDef          oc   = {0};
-    TIM_BreakDeadTimeConfigTypeDef bd = {0};
+    TIM_ClockConfigTypeDef        scc = {0};
+    TIM_MasterConfigTypeDef       mc  = {0};
+    TIM_OC_InitTypeDef            oc  = {0};
+    TIM_BreakDeadTimeConfigTypeDef bd  = {0};
 
     htim1.Instance               = TIM1;
-    htim1.Init.Prescaler         = 63;        /* overwritten by servo_config_50hz */
+    htim1.Init.Prescaler         = 63;
     htim1.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim1.Init.Period            = 19999;     /* 20 ms at 1 MHz tick */
+    htim1.Init.Period            = 19999;
     htim1.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
     htim1.Init.RepetitionCounter = 0;
     htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -819,7 +890,8 @@ static void MX_TIM1_Init(void)
 
     mc.MasterOutputTrigger = TIM_TRGO_RESET;
     mc.MasterSlaveMode     = TIM_MASTERSLAVEMODE_DISABLE;
-    if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &mc) != HAL_OK) Error_Handler();
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &mc) != HAL_OK)
+        Error_Handler();
 
     oc.OCMode       = TIM_OCMODE_PWM1;
     oc.Pulse        = SERVO_CENTER_US;
@@ -827,7 +899,8 @@ static void MX_TIM1_Init(void)
     oc.OCFastMode   = TIM_OCFAST_DISABLE;
     oc.OCIdleState  = TIM_OCIDLESTATE_RESET;
     oc.OCNIdleState = TIM_OCNIDLESTATE_RESET;
-    if (HAL_TIM_PWM_ConfigChannel(&htim1, &oc, TIM_CHANNEL_4) != HAL_OK) Error_Handler();
+    if (HAL_TIM_PWM_ConfigChannel(&htim1, &oc, TIM_CHANNEL_4) != HAL_OK)
+        Error_Handler();
 
     bd.OffStateRunMode  = TIM_OSSR_DISABLE;
     bd.OffStateIDLEMode = TIM_OSSI_DISABLE;
@@ -842,8 +915,8 @@ static void MX_TIM1_Init(void)
 }
 
 /* =====================================================================
-   TIM3 — PWM for Motor 1 speed (CH1 → PA6/ENA, CH2 → PA7)
-   72 MHz / (71+1) / (999+1) = 1 kHz PWM
+   TIM3 — ~111 Hz PWM for Motor 1 speed (CH1 → PA6)
+   8 MHz / 72 / 1000 = 111 Hz
    ===================================================================== */
 static void MX_TIM3_Init(void)
 {
@@ -854,7 +927,7 @@ static void MX_TIM3_Init(void)
     htim3.Instance               = TIM3;
     htim3.Init.Prescaler         = 71;
     htim3.Init.CounterMode       = TIM_COUNTERMODE_UP;
-    htim3.Init.Period            = M1_PWM_PERIOD;
+    htim3.Init.Period            = 999;
     htim3.Init.ClockDivision     = TIM_CLOCKDIVISION_DIV1;
     htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
     if (HAL_TIM_Base_Init(&htim3) != HAL_OK) Error_Handler();
@@ -865,20 +938,23 @@ static void MX_TIM3_Init(void)
 
     mc.MasterOutputTrigger = TIM_TRGO_RESET;
     mc.MasterSlaveMode     = TIM_MASTERSLAVEMODE_DISABLE;
-    if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &mc) != HAL_OK) Error_Handler();
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &mc) != HAL_OK)
+        Error_Handler();
 
     oc.OCMode     = TIM_OCMODE_PWM1;
     oc.Pulse      = 0;
     oc.OCPolarity = TIM_OCPOLARITY_HIGH;
     oc.OCFastMode = TIM_OCFAST_DISABLE;
-    if (HAL_TIM_PWM_ConfigChannel(&htim3, &oc, TIM_CHANNEL_1) != HAL_OK) Error_Handler();
-    if (HAL_TIM_PWM_ConfigChannel(&htim3, &oc, TIM_CHANNEL_2) != HAL_OK) Error_Handler();
+    if (HAL_TIM_PWM_ConfigChannel(&htim3, &oc, TIM_CHANNEL_1) != HAL_OK)
+        Error_Handler();
+    if (HAL_TIM_PWM_ConfigChannel(&htim3, &oc, TIM_CHANNEL_2) != HAL_OK)
+        Error_Handler();
 
     HAL_TIM_MspPostInit(&htim3);
 }
 
 /* =====================================================================
-   USART2 — 115200, 8N1, printf retarget
+   USART2 — 115200 8N1, printf retarget
    ===================================================================== */
 static void MX_USART2_UART_Init(void)
 {
@@ -900,41 +976,54 @@ static void MX_GPIO_Init(void)
 {
     GPIO_InitTypeDef g = {0};
 
-    /* Pre-set outputs LOW before enabling clocks */
     __HAL_RCC_GPIOC_CLK_ENABLE();
     __HAL_RCC_GPIOD_CLK_ENABLE();
     __HAL_RCC_GPIOA_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
-    /* ---- Output initial states ---- */
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_3|GPIO_PIN_5, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10|
-                             GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(M1_ENA_PORT, M1_ENA_PIN, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(M2_IN3_PORT, M2_IN3_PIN, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(M2_IN4_PORT, M2_IN4_PIN, GPIO_PIN_RESET);
+    /* Pre-drive outputs LOW */
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_3|GPIO_PIN_5,
+                      GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOB,
+                      GPIO_PIN_0|GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10|
+                      GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15,
+                      GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7|GPIO_PIN_8, GPIO_PIN_RESET);
 
-    /* ---- Blue button (PC13) — interrupt, no pull ---- */
+    /* Blue button PC13 — EXTI rising, no pull */
     g.Pin  = B1_Pin;
     g.Mode = GPIO_MODE_IT_RISING;
     g.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(B1_GPIO_Port, &g);
 
-    /* ---- US TRIG outputs: PC0, PC1, PC3, PC5 ---- */
+    /* US TRIG outputs: PC0, PC1, PC3, PC5 */
     g.Pin   = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_3|GPIO_PIN_5;
     g.Mode  = GPIO_MODE_OUTPUT_PP;
     g.Pull  = GPIO_NOPULL;
     g.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOC, &g);
 
-    /* ---- US ECHO inputs: PA4, PA5 (EXTI, pull-down) ---- */
+    /* US ECHO inputs PA4 (US1), PA5 (US4) — pull-down */
     g.Pin  = GPIO_PIN_4|GPIO_PIN_5;
-    g.Mode = GPIO_MODE_IT_RISING;
+    g.Mode = GPIO_MODE_INPUT;
     g.Pull = GPIO_PULLDOWN;
     HAL_GPIO_Init(GPIOA, &g);
 
-    /* ---- General PB outputs: trig PB0/PB10, buzzer PB8,
-            LEDs PB9/PB12, motor ctrl PB13/PB14/PB15 ---- */
+    /* US ECHO PC2 (US2) — pull-down input */
+    g.Pin  = GPIO_PIN_2;
+    g.Mode = GPIO_MODE_INPUT;
+    g.Pull = GPIO_PULLDOWN;
+    HAL_GPIO_Init(GPIOC, &g);
+
+    /* US ECHO PC6 (US3) — pull-down input */
+    g.Pin  = GPIO_PIN_6;
+    g.Mode = GPIO_MODE_INPUT;
+    g.Pull = GPIO_PULLDOWN;
+    HAL_GPIO_Init(GPIOC, &g);
+
+    /* GPIOB outputs: US5-trig PB0, buzzer PB8, LED1 PB9,
+                      US6-trig PB10, LED2 PB12,
+                      ENB PB13, IN1 PB14, IN2 PB15 */
     g.Pin   = GPIO_PIN_0|GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10|
               GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15;
     g.Mode  = GPIO_MODE_OUTPUT_PP;
@@ -942,32 +1031,18 @@ static void MX_GPIO_Init(void)
     g.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOB, &g);
 
-    /* ---- US ECHO inputs: PB1 (US5), PB11 (US6) — EXTI, pull-down ---- */
+    /* US ECHO PB1 (US5), PB11 (US6) — pull-down input */
     g.Pin  = GPIO_PIN_1|GPIO_PIN_11;
-    g.Mode = GPIO_MODE_IT_RISING;
+    g.Mode = GPIO_MODE_INPUT;
     g.Pull = GPIO_PULLDOWN;
     HAL_GPIO_Init(GPIOB, &g);
 
-    /* ---- US3 ECHO: PC6 — EXTI, pull-down ---- */
-    g.Pin  = GPIO_PIN_6;
-    g.Mode = GPIO_MODE_IT_RISING;
-    g.Pull = GPIO_PULLDOWN;
-    HAL_GPIO_Init(GPIOC, &g);
-
-    /* ---- Motor 2 direction: PC7, PC8 — output ---- */
+    /* Motor 2 direction: PC7 (IN3), PC8 (IN4) — output */
     g.Pin   = GPIO_PIN_7|GPIO_PIN_8;
     g.Mode  = GPIO_MODE_OUTPUT_PP;
     g.Pull  = GPIO_NOPULL;
     g.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOC, &g);
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_7|GPIO_PIN_8, GPIO_PIN_RESET);
-
-    /* ---- USART2 TX (PA2) AF, RX (PA3) floating ---- */
-    /* Handled by HAL_UART_MspInit */
-
-    /* ---- EXTI priority ---- */
-    HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
-    HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 }
 
 /* =====================================================================
