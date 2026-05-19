@@ -1,6 +1,6 @@
 ################################################################################
 # Automatically-generated file. Do not edit!
-# Toolchain: GNU Tools for STM32 (14.3.rel1)
+# Toolchain: GNU Tools for STM32 (13.3.rel1)
 ################################################################################
 
 -include ../makefile.init
@@ -60,8 +60,8 @@ all: main-build
 main-build: Sensor_Testing.elf secondary-outputs
 
 # Tool invocations
-Sensor_Testing.elf Sensor_Testing.map: $(OBJS) $(USER_OBJS) B:\College\embedded\ADAS\ Miniature\Sensor_Testing\STM32F103RBTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
-	arm-none-eabi-gcc -o "Sensor_Testing.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"B:\College\embedded\ADAS Miniature\Sensor_Testing\STM32F103RBTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="Sensor_Testing.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+Sensor_Testing.elf Sensor_Testing.map: $(OBJS) $(USER_OBJS) C:\Users\Sohan\AppData\Local\Programs\Python\Python312\adas_miniature\Sensor_Testing\STM32F103RBTX_FLASH.ld makefile objects.list $(OPTIONAL_TOOL_DEPS)
+	arm-none-eabi-gcc -o "Sensor_Testing.elf" @"objects.list" $(USER_OBJS) $(LIBS) -mcpu=cortex-m3 -T"C:\Users\Sohan\AppData\Local\Programs\Python\Python312\adas_miniature\Sensor_Testing\STM32F103RBTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="Sensor_Testing.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
 	@echo 'Finished building target: $@'
 	@echo ' '
 

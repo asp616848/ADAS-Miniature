@@ -217,6 +217,297 @@ static uint16_t read_ir(void)
     return asm_adc1_read();
 }
 
+/* C implementation equivalent of asm_adc1_read()
+ * Returns 12-bit ADC sample or 0xFFFF on error/timeout.
+ * Uses direct ADC1 register access to mirror the assembly behaviour.
+ */
+static uint16_t c_adc1_read(void)
+{
+    uint32_t timeout = 50000U;
+
+    /* Verify ADC is powered (ADON bit 0 in CR2) */
+    if ((ADC1->CR2 & 1U) == 0U) return 0xFFFFU;
+
+    /* Clear EOC flag */
+    ADC1->SR &= ~ADC_SR_EOC;
+
+    /* Set EXTTRIG (bit20) + SWSTART (bit22) to start conversion */
+    ADC1->CR2 |= (1U << 20) | (1U << 22);
+
+    /* Poll EOC with iteration timeout */
+    while ((ADC1->SR & ADC_SR_EOC) == 0U) {
+        if (--timeout == 0U) return 0xFFFFU;
+    }
+
+    return (uint16_t)(ADC1->DR & 0x0FFFU);
+}
+
+/* C equivalents for assembly primitives (for fair comparison) */
+#define DEMCR      (*(volatile uint32_t *)0xE000EDFCU)
+#define DWT_CTRL   (*(volatile uint32_t *)0xE0001000U)
+#define DWT_CYCCNT (*(volatile uint32_t *)0xE0001004U)
+
+#define GPIO_IDR_OFF   0x08U
+#define GPIO_BSRR_OFF  0x10U
+#define GPIO_BRR_OFF   0x14U
+
+#define CYCLES_PER_US  8U
+#define TRIG_LOW_CYCLES  16U
+#define TRIG_HIGH_CYCLES 80U
+#define ECHO_TIMEOUT_CYC 200000U
+
+static void c_dwt_init(void)
+{
+    /* CoreDebug->DEMCR |= TRCENA (bit 24) */
+    DEMCR |= (1U << 24);
+    /* DWT->CTRL |= CYCCNTENA (bit 0) */
+    DWT_CTRL |= 1U;
+    /* DWT->CYCCNT = 0 */
+    DWT_CYCCNT = 0U;
+}
+
+static void c_delay_us(uint32_t us)
+{
+    uint32_t start = DWT_CYCCNT;
+    uint32_t wait = us * CYCLES_PER_US;
+    while ((DWT_CYCCNT - start) < wait) {
+        ;
+    }
+}
+
+static uint32_t c_ultrasonic_ticks(GPIO_TypeDef *tp, uint16_t t_pin,
+                                   GPIO_TypeDef *ep, uint16_t e_pin)
+{
+    volatile uint32_t *trig_brr  = (volatile uint32_t *)((uint32_t)tp + GPIO_BRR_OFF);
+    volatile uint32_t *trig_bsrr = (volatile uint32_t *)((uint32_t)tp + GPIO_BSRR_OFF);
+    volatile uint32_t *echo_idr   = (volatile uint32_t *)((uint32_t)ep + GPIO_IDR_OFF);
+    uint32_t start, now;
+
+    /* TRIG LOW for 2 us */
+    *trig_brr = (uint32_t)t_pin;
+    start = DWT_CYCCNT;
+    while ((DWT_CYCCNT - start) < TRIG_LOW_CYCLES) {}
+
+    /* TRIG HIGH for 10 us */
+    *trig_bsrr = (uint32_t)t_pin;
+    start = DWT_CYCCNT;
+    while ((DWT_CYCCNT - start) < TRIG_HIGH_CYCLES) {}
+
+    /* TRIG LOW */
+    *trig_brr = (uint32_t)t_pin;
+
+    /* wait for ECHO to go HIGH with timeout */
+    start = DWT_CYCCNT;
+    while (((*echo_idr) & (uint32_t)e_pin) == 0U) {
+        now = DWT_CYCCNT;
+        if ((now - start) >= ECHO_TIMEOUT_CYC) return 0U;
+    }
+
+    /* record rise */
+    uint32_t rise = DWT_CYCCNT;
+
+    /* wait for ECHO to go LOW with timeout */
+    while (((*echo_idr) & (uint32_t)e_pin) != 0U) {
+        now = DWT_CYCCNT;
+        if ((now - rise) >= ECHO_TIMEOUT_CYC) return 0U;
+    }
+
+    return (DWT_CYCCNT - rise);
+}
+
+static void c_gpio_set(uint32_t port_base, uint32_t pin_mask)
+{
+    volatile uint32_t *bsrr = (volatile uint32_t *)(port_base + GPIO_BSRR_OFF);
+    *bsrr = pin_mask;
+}
+
+static void c_gpio_reset(uint32_t port_base, uint32_t pin_mask)
+{
+    volatile uint32_t *brr = (volatile uint32_t *)(port_base + GPIO_BRR_OFF);
+    *brr = pin_mask;
+}
+
+static void c_tim_set_ccr(uint32_t tim_base, uint32_t ccr_off, uint32_t val)
+{
+    volatile uint32_t *ccr = (volatile uint32_t *)(tim_base + ccr_off);
+    *ccr = val;
+}
+
+/* Read DWT cycle counter directly (memory-mapped) */
+static inline uint32_t dwt_get_cycles(void)
+{
+    return (*(volatile uint32_t *)0xE0001004U);
+}
+
+/* Quick perf test: measures a few assembly primitives and prints cycles */
+static void perf_test(void)
+{
+    const int N = 8;
+    uint32_t t0, t1;
+    uint32_t cycles;
+    uint32_t min, max;
+    uint64_t sum;
+
+    printf("PERF: starting %d-iteration assembly primitives test\r\n", N);
+
+    /* ----- asm_ultrasonic_ticks (cycles) ----- */
+    min = UINT32_MAX; max = 0; sum = 0;
+    for (int i = 0; i < N; ++i) {
+        t0 = dwt_get_cycles();
+        uint32_t res = asm_ultrasonic_ticks(US1_TRIG_PORT, US1_TRIG_PIN,
+                                           US1_ECHO_PORT, US1_ECHO_PIN);
+        t1 = dwt_get_cycles();
+        cycles = (t1 - t0);
+        if (cycles < min) min = cycles;
+        if (cycles > max) max = cycles;
+        sum += cycles;
+        printf("  iter %d: cycles=%lu us=%lu res=%lu\r\n",
+               i, (unsigned long)cycles, (unsigned long)(cycles/8U), (unsigned long)res);
+        HAL_Delay(5U);
+    }
+    printf("PERF asm_ultrasonic_ticks: min=%lu avg=%lu max=%lu (cycles)\r\n",
+           (unsigned long)min, (unsigned long)(sum / N), (unsigned long)max);
+
+    /* ----- c_ultrasonic_ticks ----- */
+    min = UINT32_MAX; max = 0; sum = 0;
+    for (int i = 0; i < N; ++i) {
+        t0 = dwt_get_cycles();
+        uint32_t res = c_ultrasonic_ticks(US1_TRIG_PORT, US1_TRIG_PIN,
+                                         US1_ECHO_PORT, US1_ECHO_PIN);
+        t1 = dwt_get_cycles();
+        cycles = (t1 - t0);
+        if (cycles < min) min = cycles;
+        if (cycles > max) max = cycles;
+        sum += cycles;
+        printf("  iter %d: cycles=%lu us=%lu res=%lu\r\n",
+               i, (unsigned long)cycles, (unsigned long)(cycles/8U), (unsigned long)res);
+        HAL_Delay(5U);
+    }
+    printf("PERF c_ultrasonic_ticks: min=%lu avg=%lu max=%lu (cycles)\r\n",
+           (unsigned long)min, (unsigned long)(sum / N), (unsigned long)max);
+
+    /* ----- asm_adc1_read ----- */
+    min = UINT32_MAX; max = 0; sum = 0;
+    for (int i = 0; i < N; ++i) {
+        t0 = dwt_get_cycles();
+        uint16_t adc = asm_adc1_read();
+        t1 = dwt_get_cycles();
+        cycles = (t1 - t0);
+        if (cycles < min) min = cycles;
+        if (cycles > max) max = cycles;
+        sum += cycles;
+        printf("  iter %d: cycles=%lu us=%lu adc=0x%04X\r\n",
+               i, (unsigned long)cycles, (unsigned long)(cycles/8U), (unsigned int)adc);
+        HAL_Delay(2U);
+    }
+    printf("PERF asm_adc1_read: min=%lu avg=%lu max=%lu (cycles)\r\n",
+           (unsigned long)min, (unsigned long)(sum / N), (unsigned long)max);
+
+        /* ----- c_adc1_read (C implementation) ----- */
+        min = UINT32_MAX; max = 0; sum = 0;
+        for (int i = 0; i < N; ++i) {
+         t0 = dwt_get_cycles();
+         uint16_t adc_c = c_adc1_read();
+         t1 = dwt_get_cycles();
+         cycles = (t1 - t0);
+         if (cycles < min) min = cycles;
+         if (cycles > max) max = cycles;
+         sum += cycles;
+         printf("  iter %d: cycles=%lu us=%lu adc_c=0x%04X\r\n",
+             i, (unsigned long)cycles, (unsigned long)(cycles/8U), (unsigned int)adc_c);
+         HAL_Delay(2U);
+        }
+        printf("PERF c_adc1_read: min=%lu avg=%lu max=%lu (cycles)\r\n",
+            (unsigned long)min, (unsigned long)(sum / N), (unsigned long)max);
+
+    /* ----- asm_gpio_set ----- */
+    min = UINT32_MAX; max = 0; sum = 0;
+    for (int i = 0; i < N; ++i) {
+        t0 = dwt_get_cycles();
+        asm_gpio_set(M1_IN1_BASE, M1_IN1_PIN);
+        t1 = dwt_get_cycles();
+        cycles = (t1 - t0);
+        if (cycles < min) min = cycles;
+        if (cycles > max) max = cycles;
+        sum += cycles;
+    }
+    printf("PERF asm_gpio_set: min=%lu avg=%lu max=%lu (cycles)\r\n",
+           (unsigned long)min, (unsigned long)(sum / N), (unsigned long)max);
+
+    /* ----- c_gpio_set ----- */
+    min = UINT32_MAX; max = 0; sum = 0;
+    for (int i = 0; i < N; ++i) {
+        t0 = dwt_get_cycles();
+        c_gpio_set(M1_IN1_BASE, M1_IN1_PIN);
+        t1 = dwt_get_cycles();
+        cycles = (t1 - t0);
+        if (cycles < min) min = cycles;
+        if (cycles > max) max = cycles;
+        sum += cycles;
+    }
+    printf("PERF c_gpio_set: min=%lu avg=%lu max=%lu (cycles)\r\n",
+           (unsigned long)min, (unsigned long)(sum / N), (unsigned long)max);
+
+    /* ----- asm_gpio_reset ----- */
+    min = UINT32_MAX; max = 0; sum = 0;
+    for (int i = 0; i < N; ++i) {
+        t0 = dwt_get_cycles();
+        asm_gpio_reset(M1_IN1_BASE, M1_IN1_PIN);
+        t1 = dwt_get_cycles();
+        cycles = (t1 - t0);
+        if (cycles < min) min = cycles;
+        if (cycles > max) max = cycles;
+        sum += cycles;
+    }
+    printf("PERF asm_gpio_reset: min=%lu avg=%lu max=%lu (cycles)\r\n",
+           (unsigned long)min, (unsigned long)(sum / N), (unsigned long)max);
+
+    /* ----- c_gpio_reset ----- */
+    min = UINT32_MAX; max = 0; sum = 0;
+    for (int i = 0; i < N; ++i) {
+        t0 = dwt_get_cycles();
+        c_gpio_reset(M1_IN1_BASE, M1_IN1_PIN);
+        t1 = dwt_get_cycles();
+        cycles = (t1 - t0);
+        if (cycles < min) min = cycles;
+        if (cycles > max) max = cycles;
+        sum += cycles;
+    }
+    printf("PERF c_gpio_reset: min=%lu avg=%lu max=%lu (cycles)\r\n",
+           (unsigned long)min, (unsigned long)(sum / N), (unsigned long)max);
+
+    /* ----- asm_tim_set_ccr ----- */
+    min = UINT32_MAX; max = 0; sum = 0;
+    for (int i = 0; i < N; ++i) {
+        t0 = dwt_get_cycles();
+        asm_tim_set_ccr((uint32_t)TIM1, TIM_CCR4_OFF, SERVO_CENTER_US);
+        t1 = dwt_get_cycles();
+        cycles = (t1 - t0);
+        if (cycles < min) min = cycles;
+        if (cycles > max) max = cycles;
+        sum += cycles;
+    }
+    printf("PERF asm_tim_set_ccr: min=%lu avg=%lu max=%lu (cycles)\r\n",
+           (unsigned long)min, (unsigned long)(sum / N), (unsigned long)max);
+
+    /* ----- c_tim_set_ccr ----- */
+    min = UINT32_MAX; max = 0; sum = 0;
+    for (int i = 0; i < N; ++i) {
+        t0 = dwt_get_cycles();
+        c_tim_set_ccr((uint32_t)TIM1, TIM_CCR4_OFF, SERVO_CENTER_US);
+        t1 = dwt_get_cycles();
+        cycles = (t1 - t0);
+        if (cycles < min) min = cycles;
+        if (cycles > max) max = cycles;
+        sum += cycles;
+    }
+    printf("PERF c_tim_set_ccr: min=%lu avg=%lu max=%lu (cycles)\r\n",
+           (unsigned long)min, (unsigned long)(sum / N), (unsigned long)max);
+
+    printf("PERF: multi-iteration test complete\r\n");
+    HAL_Delay(50U);
+}
+
 /* =====================================================================
    NAVIGATION HELPER
    ===================================================================== */
@@ -709,6 +1000,13 @@ int main(void)
 
     /* Assembly DWT init (replaces C DWT_Init) */
     asm_dwt_init();
+
+    /* Ensure ADC is started so asm_adc1_read() can return valid samples */
+    HAL_ADC_Start(&hadc1);
+    HAL_Delay(1U);
+
+    /* Run a multi-iteration performance test of assembly primitives */
+    perf_test();
 
     /* Servo: configure 50 Hz, center position */
     servo_config_50hz();
